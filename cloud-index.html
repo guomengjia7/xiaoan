@@ -2,7 +2,6 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
@@ -200,6 +199,1840 @@ select.inp{appearance:none;background:#fff url("data:image/svg+xml,%3Csvg xmlns=
 </head>
 <body>
 <div id="app"></div>
+<script>
+/* 「小安」仓库管理 v2 - 移动端单页应用（全量复刻线上版） */
+'use strict';
+
+/* ===== 基础工具 ===== */
+const TOKEN_KEY = 'xiaoan_v2_token';
+const USER_KEY = 'xiaoan_v2_user';
+const $ = sel => document.querySelector(sel);
+const el = (tag, cls, html) => { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; };
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const trim = s => String(s == null ? '' : s).replace(/^[\s﻿\xA0]+|[\s﻿\xA0]+$/g, '');
+const fmtQty = n => { const x = Number(n) || 0; return x.toLocaleString('zh-CN'); };
+
+function getToken() { return localStorage.getItem(TOKEN_KEY) || ''; }
+function getUser() { try { return JSON.parse(localStorage.getItem(USER_KEY) || 'null'); } catch { return null; } }
+function setAuth(token, user) { localStorage.setItem(TOKEN_KEY, token); localStorage.setItem(USER_KEY, JSON.stringify(user)); }
+function clearAuth() { localStorage.removeItem(TOKEN_KEY); localStorage.removeItem(USER_KEY); }
+const isAdmin = () => getUser()?.role === 'admin';
+const ROLE_NAME = { admin: '管理员', user: '员工', picker: '分货员', temp: '临时工' };
+
+/* Toast */
+let toastTimer = null;
+function toast(msg, isErr) {
+  document.querySelectorAll('.toast').forEach(t => t.remove());
+  const t = el('div', 'toast' + (isErr ? ' err' : ''), esc(msg));
+  document.body.appendChild(t);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.remove(), 2200);
+}
+
+/* ===== 云端/本地双模式 API 层 =====
+ * 云端模式：直连 Supabase（手机流量可用，无需内网）
+ * 本地模式：走后端 server.js（你电脑，同 WiFi 可用）
+ * 通过 localStorage 的 xiaoan_cloud 开关切换（登录页可配）
+ */
+const SUPA_URL = 'https://ianeqrdqowxxqicikrtv.supabase.co';
+const SUPA_KEY = 'sb_publishable_Cl7vavkrpbV9yvGo9wLuCw_8JJzW8cO';
+const isCloud = () => localStorage.getItem('xiaoan_cloud') !== '0';
+
+/* Supabase REST 直连工具（云端模式专用） */
+const supa = {
+  async rest(table, { select = '*', filter = '', order = '', limit = 0, single = false } = {}) {
+    let url = `${SUPA_URL}/rest/v1/${table}?select=${encodeURIComponent(select)}`;
+    if (filter) url += '&' + filter;
+    if (order) url += '&order=' + order;
+    if (limit) url += '&limit=' + limit;
+    const res = await fetch(url, { headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}` } });
+    if (!res.ok) {
+      const t = await res.text().catch(() => '');
+      throw new Error(`云端查询失败(${res.status})`);
+    }
+    const data = await res.json();
+    return single ? (data[0] || null) : data;
+  },
+  async insert(table, row) {
+    const res = await fetch(`${SUPA_URL}/rest/v1/${table}`, {
+      method: 'POST',
+      headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, 'Content-Type': 'application/json', Prefer: 'return=representation' },
+      body: JSON.stringify(row),
+    });
+    if (!res.ok) throw new Error('云端写入失败：' + (await res.text().catch(() => res.status)));
+    return (await res.json())[0];
+  },
+  async update(table, filter, patch) {
+    const res = await fetch(`${SUPA_URL}/rest/v1/${table}?${filter}`, {
+      method: 'PATCH',
+      headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, 'Content-Type': 'application/json', Prefer: 'return=representation' },
+      body: JSON.stringify(patch),
+    });
+    if (!res.ok) throw new Error('云端更新失败：' + (await res.text().catch(() => res.status)));
+    return res.json();
+  },
+};
+
+/* 统一 api()：本地模式转发后端，云端模式走 supa 直连（逐页迁移） */
+async function api(path, opts = {}) {
+  const headers = { 'Content-Type': 'application/json' };
+  const token = getToken();
+  if (token) headers.Authorization = 'Bearer ' + token;
+  let res;
+  try {
+    res = await fetch('/api' + path, { method: opts.method || 'GET', headers, body: opts.body ? JSON.stringify(opts.body) : undefined });
+  } catch { throw new Error('网络连接失败，请检查网络'); }
+  let data = {};
+  try { data = await res.json(); } catch {}
+  if (res.status === 401) { clearAuth(); location.hash = '#/login'; throw new Error('登录已过期，请重新登录'); }
+  if (!res.ok) throw new Error(data.error || '请求失败');
+  return data;
+}
+
+/* 弹窗 */
+function showSheet(title, contentNode, onClose) {
+  const mask = el('div', 'mask');
+  const sheet = el('div', 'sheet');
+  const t = el('div', 'sheet-title', esc(title) + '<button class="close">×</button>');
+  t.querySelector('.close').onclick = () => { mask.remove(); onClose && onClose(); };
+  sheet.appendChild(t); sheet.appendChild(contentNode); mask.appendChild(sheet);
+  mask.addEventListener('click', e => { if (e.target === mask) { mask.remove(); onClose && onClose(); } });
+  document.body.appendChild(mask);
+  return mask;
+}
+function confirmBox(msg, danger) {
+  return new Promise(resolve => {
+    const wrap = el('div');
+    wrap.innerHTML = `<div style="font-size:14px;line-height:1.7;margin-bottom:16px">${esc(msg)}</div>
+      <div style="display:flex;gap:10px"><button class="btn ghost" data-a="no">取消</button><button class="btn ${danger?'danger':'primary'}" data-a="yes">确定</button></div>`;
+    const mask = showSheet('操作确认', wrap, () => resolve(false));
+    wrap.querySelector('[data-a="yes"]').onclick = () => { mask.remove(); resolve(true); };
+    wrap.querySelector('[data-a="no"]').onclick = () => { mask.remove(); resolve(false); };
+  });
+}
+
+/* 布局组件 */
+function navbar(title, back, right) {
+  return `<div class="navbar">
+    ${back ? '<button class="back" onclick="history.back()">‹</button>' : '<span style="width:8px"></span>'}
+    <div class="title">${esc(title)}</div>
+    <div class="nav-right">${right || '<span style="width:8px"></span>'}</div>
+  </div>`;
+}
+function tabbar(active) {
+  return `<div class="tabbar">
+    <a href="#/" class="${active === 'home' ? 'active' : ''}"><span class="ico">🏠</span>首页</a>
+    <a href="#/records" class="${active === 'records' ? 'active' : ''}"><span class="ico">📋</span>记录</a>
+    <a href="#/me" class="${active === 'me' ? 'active' : ''}"><span class="ico">👤</span>我的</a>
+  </div>`;
+}
+function badge(role) { return `<span class="badge admin">👑 ${esc(ROLE_NAME[role] || role)}</span>`; }
+
+/* ===== 登录页 ===== */
+function renderLogin() {
+  $('#app').innerHTML = `
+  <div class="login-page">
+    <div class="login-logo">📦</div>
+    <div class="login-title">小安</div>
+    <div class="login-sub">轻松管理耗材库存与出入库<br>管理员/员工/分货员账号均可使用</div>
+    <div class="login-card">
+      <div class="field"><label class="req">管理员账号</label>
+        <div class="input-group"><span class="ig-ico">👤</span><input id="lg-user" placeholder="请输入账号" autocomplete="username"></div></div>
+      <div class="field"><label class="req">密码</label>
+        <div class="input-group"><span class="ig-ico">🔒</span><input id="lg-pw" type="password" placeholder="请输入密码" autocomplete="current-password"></div></div>
+      <div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:14px">
+        <button id="lg-agree" style="width:20px;height:20px;border:2px solid #cbd5e1;border-radius:6px;margin-top:1px;flex-shrink:0"></button>
+        <span style="font-size:12px;color:var(--muted-foreground);line-height:1.5">我已阅读并同意 <span style="color:var(--primary)">《用户协议》</span> 和 <span style="color:var(--primary)">《隐私政策》</span></span>
+      </div>
+      <button class="btn primary" id="lg-btn">登 录</button>
+      <div style="display:flex;align-items:center;justify-content:center;gap:6px;margin-top:10px">
+        <label style="font-size:12px;color:var(--muted-foreground);display:flex;align-items:center;gap:5px;cursor:pointer">
+          <input type="checkbox" id="lg-cloud" ${isCloud() ? 'checked' : ''} style="width:14px;height:14px"> 云端模式（手机流量）
+        </label>
+      </div>
+      <div class="login-tip">内部管理工具 · 多端数据实时互通</div>
+    </div>
+  </div>`;
+  let agreed = false;
+  $('#lg-cloud').onchange = e => { localStorage.setItem('xiaoan_cloud', e.target.checked ? '1' : '0'); };
+  $('#lg-agree').onclick = () => {
+    agreed = !agreed;
+    const b = $('#lg-agree');
+    b.style.background = agreed ? 'var(--primary)' : 'transparent';
+    b.style.borderColor = agreed ? 'var(--primary)' : '#cbd5e1';
+    b.innerHTML = agreed ? '<span style="color:#fff;font-size:13px;line-height:16px">✓</span>' : '';
+  };
+  const doLogin = async () => {
+    if (!agreed) return toast('请先阅读并同意用户协议和隐私政策', true);
+    const username = trim($('#lg-user').value), password = $('#lg-pw').value;
+    if (!username || !password) return toast('请输入账号和密码', true);
+    const btn = $('#lg-btn'); btn.disabled = true; btn.textContent = '登录中...';
+    try {
+      if (isCloud()) {
+        // 云端模式：RPC 验证
+        const res = await fetch(`${SUPA_URL}/rest/v1/rpc/verify_login`, {
+          method: 'POST',
+          headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ p_username: username, p_password: password }),
+        });
+        if (!res.ok) throw new Error('云端登录失败');
+        const r = await res.json();
+        if (!r.ok) throw new Error(r.msg || '账号或密码错误');
+        setAuth('cloud:' + crypto.randomUUID(), r.user);
+      } else {
+        const r = await api('/auth/login', { method: 'POST', body: { username, password } });
+        setAuth(r.token, r.user);
+      }
+      location.hash = '#/';
+    } catch (e) { toast(e.message, true); }
+    btn.disabled = false; btn.textContent = '登 录';
+  };
+  $('#lg-btn').onclick = doLogin;
+  $('#lg-pw').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+}
+
+/* ===== 首页 ===== */
+async function renderHome(container) {
+  const u = getUser();
+  container.innerHTML = navbar('首页', false, `<a href="#/home-sort" style="font-size:12px;color:var(--muted-foreground)">↕️ 排序</a>`) + `
+  <div class="page-body" id="home-body"><div class="loading">加载中...</div></div>`;
+  try {
+    let d, stats;
+    if (isCloud()) {
+      // 云端模式：并行查云端聚合出仪表盘数据
+      const [cons, fg, todayInLogs, todayPick] = await Promise.all([
+        supa.rest('consumables', { select: 'stock,safety_stock' }),
+        supa.rest('finished_goods_stock', { select: 'ground_quantity,high_shelf_quantity,pick_quantity,new_quantity,system_stock' }),
+        supa.rest('putaway_operation_logs', { select: 'quantity', filter: `created_at=gte.${new Date(Date.now() - 864e5).toISOString()}` }),
+        supa.rest('finished_goods_picking_records', { select: 'quantity', filter: `created_at=gte.${new Date(Date.now() - 864e5).toISOString()}` }),
+      ]);
+      const sum = (a, k) => a.reduce((s, x) => s + (Number(x[k]) || 0), 0);
+      d = {
+        consumables: { total: cons.length, low: cons.filter(c => Number(c.stock) < Number(c.safety_stock)).length, totalStock: sum(cons, 'stock') },
+        finishedGoods: {
+          skus: fg.length,
+          zero: fg.filter(f => (Number(f.ground_quantity) || 0) + (Number(f.high_shelf_quantity) || 0) + (Number(f.pick_quantity) || 0) + (Number(f.new_quantity) || 0) === 0).length,
+          total: sum(fg, 'ground_quantity') + sum(fg, 'high_shelf_quantity') + sum(fg, 'pick_quantity'),
+          newQty: sum(fg, 'new_quantity'),
+          todayIn: sum(todayInLogs, 'quantity'),
+          todayOut: sum(todayPick, 'quantity'),
+        },
+      };
+      // 翻新统计（简化云端版）
+      const physTotal = sum(fg, 'ground_quantity') + sum(fg, 'high_shelf_quantity') + sum(fg, 'pick_quantity');
+      let ss = 0; fg.forEach(f => ss += Math.min(Number(f.system_stock) || 0, (Number(f.ground_quantity) || 0) + (Number(f.high_shelf_quantity) || 0) + (Number(f.pick_quantity) || 0)));
+      stats = { pending: ss, canRenovate: ss, noRenoQty: 0, remaining: Math.max(0, physTotal - ss), note: '云端简化版' };
+    } else {
+      [d, stats] = await Promise.all([api('/dashboard'), api('/renovation-stats')]);
+    }
+    const body = $('#home-body');
+    body.innerHTML = `
+    <div class="banner">
+      <div>
+        <div class="hi">你好，${esc(u.username)}</div>
+        <div class="sub">今天也要轻松管理耗材哦</div>
+      </div>
+      ${badge(u.role)}
+    </div>
+    ${isAdmin() ? `
+    <div class="card" style="cursor:pointer" onclick="location.hash='#/renovation-stats'">
+      <div style="display:flex;align-items:center;gap:10px">
+        <div style="width:44px;height:44px;border-radius:12px;background:var(--purple-soft);display:flex;align-items:center;justify-content:center;font-size:21px">🔍</div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:6px"><span style="font-weight:700">翻新匹配统计</span>${badge(u.role)}</div>
+          <div style="font-size:11px;color:var(--muted-foreground);margin-top:2px">待翻新 / 可翻新 / 无法翻新 · 逐项瓶颈明细</div>
+        </div>
+        <span style="color:var(--muted);font-size:18px">›</span>
+      </div>
+    </div>` : ''}
+    <div class="section-title">常用功能 <span style="font-weight:400;font-size:11px;color:var(--muted)">根据你的使用频率自动推荐</span></div>
+    <div class="grid-3">
+      <a class="g-item" href="#/fg-stock"><span class="g-ico" style="background:var(--teal-soft)">🔎</span><span class="g-name">实物库存查询</span><span class="g-desc">成品SKU/PN/储位</span></a>
+      <a class="g-item" href="#/putaway"><span class="g-ico" style="background:var(--green-soft)">📥</span><span class="g-name">上架作业</span><span class="g-desc">成品入库上架推荐</span></a>
+      <a class="g-item" href="#/box-label"><span class="g-ico" style="background:var(--primary-soft)">🖨️</span><span class="g-name">箱唛标签打印</span><span class="g-desc">100x150满幅标签/拣货位自适应</span></a>
+    </div>
+    ${renderAccordions(u)}
+    <div class="card" style="cursor:pointer" onclick="location.hash='#/users'">
+      <div style="display:flex;align-items:center;gap:10px">
+        <div style="width:40px;height:40px;border-radius:12px;background:var(--primary-soft);display:flex;align-items:center;justify-content:center;font-size:19px">👥</div>
+        <div style="flex:1"><div style="font-weight:700">账号管理</div><div style="font-size:11px;color:var(--muted-foreground)">为员工开通账号</div></div>
+        ${isAdmin() ? badge('admin') : ''}
+        <span style="color:var(--muted);font-size:18px">›</span>
+      </div>
+    </div>`;
+    bindAccordions();
+  } catch (e) { $('#home-body').innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
+}
+
+function renderAccordions(u) {
+  const ACC = [
+    { key: 'fg', title: '成品实物库存', ico: '🏭', cls: 'var(--teal-soft)', adminOnly: false, items: [
+      { name: '箱唛标签打印', desc: '100x150满幅标签/拣货位自适应', href: '#/box-label' },
+      { name: '上架作业', desc: '扫SKU/储位上架', href: '#/putaway' },
+      { name: '实物库存查询', desc: '成品SKU/PN/储位', href: '#/fg-stock' },
+      { name: '账实差异提醒', desc: '系统数vs实物数差距大的SKU', href: '#/stock-gap' },
+      { name: '拣货出库', desc: '智能推荐/导出/扣减', href: '#/fg-picking' },
+      { name: '可上架匹配', desc: 'SKU+LG08可上架计算', href: '#/putaway-match' },
+      { name: '热度标签管理', desc: '爆品/淡品修正', href: '#/heat-labels' },
+      { name: '逆向移库', desc: 'AA/AB成品仓移库', href: '#/transfer' },
+      { name: '实物库存盘点', desc: '逐件/批量盘点成品', href: '#/fg-inventory' },
+    ]},
+    { key: 'reno', title: '翻新管理', ico: '♻️', cls: 'var(--green-soft)', adminOnly: false, items: [
+      { name: '翻新后库存查询', desc: '状态/成色筛选', href: '#/reno-inventory' },
+      { name: '翻新后出库匹配', desc: '匹配出库与扣减库存', href: '#/reno-outbound' },
+      { name: '翻新后上架作业', desc: '扫码SKU上架到货架', href: '#/reno-putaway' },
+      { name: '翻新后移库操作', desc: '翻新后储位间互相移库', href: '#/reno-transfer' },
+      { name: '翻新箱唛打印', desc: '100x150标签/状态性质联动', href: '#/reno-label' },
+    ]},
+    { key: 'con', title: '耗材管理', ico: '📦', cls: 'var(--primary-soft)', adminOnly: false, items: [
+      { name: '耗材列表', desc: '查看全部耗材', href: '#/consumables' },
+      { name: '入库登记', desc: '耗材入库', href: '#/stock-io?type=in' },
+      { name: '出库登记', desc: '领用出库', href: '#/stock-io?type=out' },
+      { name: '包材采购建议', desc: '积压清理加急 + 安全库存补货', href: '#/purchase-advice' },
+      { name: '在途库存', desc: '到仓自动入库', href: '#/transit' },
+      { name: '使用排行', desc: '使用频率统计', href: '#/usage-rank' },
+      { name: '包材库存盘点', desc: '扫码盘点货架包材', href: '#/con-inventory' },
+      { name: 'SKU映射管理', desc: 'SKU ↔ 包材绑定映射', href: '#/sku-mappings' },
+    ]},
+    { key: 'distr', title: '分货作业', ico: '🚚', cls: 'var(--orange-soft)', adminOnly: false, items: [
+      { name: '分货基础数据', desc: 'SKU通道储位映射', href: '#/distr-mapping' },
+      { name: '分货作业', desc: '查SKU分通道储位', href: '#/distr-work' },
+      { name: '分货统计', desc: '按人/时段汇总', href: '#/distr-stats' },
+    ]},
+    { key: 'unpack', title: '拆包作业', ico: '✂️', cls: 'var(--purple-soft)', adminOnly: false, items: [
+      { name: '拆包统计', desc: 'Excel导入/产能看板/报表导出', href: '#/unpack-stats' },
+    ]},
+  ];
+  return ACC.filter(a => !a.adminOnly || isAdmin()).map(a => `
+    <div class="accordion" data-acc="${a.key}">
+      <div class="acc-head" onclick="toggleAcc('${a.key}')">
+        <div class="left"><span class="a-ico" style="background:${a.cls}">${a.ico}</span><span class="a-title">${esc(a.title)}</span></div>
+        <span class="acc-arrow" id="acc-arrow-${a.key}">⌄</span>
+      </div>
+      <div class="acc-body" id="acc-body-${a.key}">
+        ${a.items.map(i => `
+        <a class="sub-item" href="${i.href}">
+          <div class="s-text"><div class="s-name">${esc(i.name)}</div><div class="s-desc">${esc(i.desc)}</div></div>
+          <span class="s-arrow">›</span>
+        </a>`).join('')}
+      </div>
+    </div>`).join('');
+}
+function toggleAcc(key) {
+  const body = $('#acc-body-' + key), arrow = $('#acc-arrow-' + key);
+  const open = body.classList.toggle('open');
+  arrow.classList.toggle('open', open);
+}
+function bindAccordions() { /* toggleAcc 内联调用即可 */ }
+
+/* ===== 记录页 ===== */
+async function renderRecords(container) {
+  container.innerHTML = navbar('记录', false) + `
+  <div class="page-body">
+    <div class="card">
+      <div class="card-title" style="margin-bottom:10px">筛选查询</div>
+      <div class="field"><label>模块</label>
+        <select class="inp" id="rc-module"><option value="">全部模块</option></select></div>
+      <div class="field"><label>操作人</label><input class="inp" id="rc-operator" placeholder="操作人"></div>
+      <div class="field"><label>SKU</label><input class="inp" id="rc-sku" placeholder="精准匹配 SKU"></div>
+      <div style="display:flex;gap:8px">
+        <div class="field" style="flex:1"><label>开始日期</label><input class="inp" id="rc-from" type="date"></div>
+        <div class="field" style="flex:1"><label>结束日期</label><input class="inp" id="rc-to" type="date"></div>
+      </div>
+      <button class="btn primary" id="rc-search">查 询</button>
+    </div>
+    <div id="rc-list"><div class="loading">加载中...</div></div>
+  </div>`;
+  const load = async () => {
+    const params = new URLSearchParams();
+    if ($('#rc-module').value) params.set('module', $('#rc-module').value);
+    if (trim($('#rc-operator').value)) params.set('operator', trim($('#rc-operator').value));
+    if (trim($('#rc-sku').value)) params.set('sku', trim($('#rc-sku').value));
+    if ($('#rc-from').value) params.set('from', $('#rc-from').value);
+    if ($('#rc-to').value) params.set('to', $('#rc-to').value);
+    const listEl = $('#rc-list');
+    listEl.innerHTML = '<div class="loading">加载中...</div>';
+    try {
+      const r = await api('/unified-logs?' + params.toString());
+      // 填充模块下拉
+      const sel = $('#rc-module');
+      if (!sel.options.length || sel.options.length === 1) {
+        r.modules.forEach(m => { const o = document.createElement('option'); o.value = m; o.textContent = m; sel.appendChild(o); });
+      }
+      document.querySelector('.card-title').textContent = `筛选查询（共 ${r.total.toLocaleString()} 条）`;
+      if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无记录</div>';
+      listEl.innerHTML = r.list.map(x => `
+      <div class="list-item">
+        <div class="li-head"><span style="font-size:13px;font-weight:700">${esc(x.module_name || '-')}</span>
+          <span style="font-size:11px;color:var(--muted)">${esc((x.operation_time || '').replace('T', ' ').slice(0, 19))}</span></div>
+        ${(x.operator || x.operator_name) ? `<div class="li-row"><span>出库人:<b>${esc(x.operator || x.operator_name)}</b></span>${x.sku ? `<span>SKU:<b>${esc(x.sku)}</b></span>` : ''}</div>` : (x.sku ? `<div class="li-row"><span>SKU:<b>${esc(x.sku)}</b></span></div>` : '')}
+        <div style="font-size:13px;margin-top:5px;line-height:1.6">${esc(x.operation_content || '-')}</div>
+      </div>`).join('');
+    } catch (e) { listEl.innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
+  };
+  $('#rc-search').onclick = load;
+  load();
+}
+
+/* ===== 我的页 ===== */
+function renderMe(container) {
+  const u = getUser();
+  if (!u) { location.hash = '#/login'; return; }
+  container.innerHTML = `
+  <div class="profile-head">
+    <div style="font-size:36px;margin-bottom:6px">👤</div>
+    <div class="p-name">${esc(u.username)}</div>
+    <div class="p-sub">${esc(ROLE_NAME[u.role] || u.role)} · ${u.permissions?.length || 0} 项权限</div>
+  </div>
+  <div class="page-body">
+    <div class="card" style="padding:4px 14px">
+      <a class="menu-item" href="#/users"><span class="m-ico">👥</span><span class="m-text">账号管理</span><span class="m-arrow">›</span></a>
+    </div>
+    <div class="card" style="padding:4px 14px">
+      <a class="menu-item" href="#/change-password"><span class="m-ico">🔐</span><span class="m-text">账号安全</span><span class="m-arrow">›</span></a>
+      <div class="menu-item" style="cursor:default"><span class="m-ico">🔠</span><span class="m-text">字体大小（仅当前设备生效）</span><span class="m-arrow">›</span></div>
+    </div>
+    <div class="card" style="padding:4px 14px;font-size:13px;color:var(--muted-foreground)">
+      <div class="menu-item" style="cursor:default">隐私政策</div>
+      <div class="menu-item" style="cursor:default">用户协议</div>
+    </div>
+    <div class="card" style="padding:4px 14px">
+      <button class="btn ghost" id="me-logout" style="border:none;color:var(--red);height:48px">退出登录</button>
+    </div>
+    <div style="text-align:center;font-size:11px;color:var(--muted);margin-top:12px">耗材管理系统 v2.0.0</div>
+  </div>`;
+  $('#me-logout').onclick = async () => {
+    if (!(await confirmBox('确定退出登录吗？'))) return;
+    try { await api('/auth/logout', { method: 'POST', body: {} }); } catch {}
+    clearAuth(); location.hash = '#/login';
+  };
+}
+
+/* ===== 耗材列表 ===== */
+async function renderConsumables(container) {
+  container.innerHTML = navbar('耗材库存', true, isAdmin() ? `<button class="btn tiny primary" id="c-add">+ 新增</button>` : '') + `
+  <div class="page-body">
+    <div class="search-bar"><input class="inp" id="c-q" placeholder="搜索名称 / 编码 / 储位"><button class="btn primary" id="c-search">搜索</button></div>
+    <div id="c-stats"><div class="loading">加载中...</div></div>
+    <div id="c-list"></div>
+  </div>`;
+  const load = async () => {
+    const listEl = $('#c-list'), statEl = $('#c-stats');
+    listEl.innerHTML = '<div class="loading">加载中...</div>';
+    try {
+      const q = trim($('#c-q').value);
+      let r;
+      if (isCloud()) {
+        const ors = q ? [`name=ilike.*${q}*`, `material_name=ilike.*${q}*`, `shelf_code=ilike.*${q}*`, `category=ilike.*${q}*`] : [];
+        const list = await supa.rest('consumables', {
+          select: 'id,name,category,spec,unit,stock,safety_stock,shelf_code,material_name,moq,updated_at',
+          filter: ors.length ? 'or=(' + ors.join(',') + ')' : '',
+          order: 'updated_at.desc', limit: 500,
+        });
+        // 低库存排序置顶
+        list.sort((a, b) => ((Number(a.stock) < Number(a.safety_stock)) ? 0 : 1) - ((Number(b.stock) < Number(b.safety_stock)) ? 0 : 1));
+        const totalStock = list.reduce((s, x) => s + (Number(x.stock) || 0), 0);
+        const low = list.filter(x => Number(x.stock) < Number(x.safety_stock)).length;
+        r = { list, stats: { total: list.length, totalStock, low } };
+      } else {
+        r = await api('/consumables' + (q ? `?q=${encodeURIComponent(q)}` : ''));
+      }
+      statEl.innerHTML = `
+      <div class="stat-grid cols-3">
+        <div class="stat-card"><div class="label">耗材种类</div><div class="value">${fmtQty(r.stats.total)}</div></div>
+        <div class="stat-card"><div class="label">库存总量</div><div class="value">${fmtQty(Math.round(r.stats.totalStock))}</div></div>
+        <div class="stat-card" style="${r.stats.low ? 'color:var(--red)' : ''}"><div class="label">低库存</div><div class="value" style="${r.stats.low ? 'color:var(--red)' : ''}">${fmtQty(r.stats.low)}</div></div>
+      </div>`;
+      if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>未找到耗材</div>';
+      listEl.innerHTML = r.list.map((c, i) => {
+        const low = c.stock < c.safety_stock;
+        return `
+        <div class="list-item">
+          <div class="li-head"><span class="li-name">${esc(c.name)}</span>${low ? '<span class="badge red">低库存</span>' : '<span class="badge green">正常</span>'}</div>
+          <div class="li-row"><span>仓库: ${esc((c.shelf_code || '-').split('-')[0])}</span><span>库位:<b>${esc(c.shelf_code || '-')}</b></span>${c.moq ? `<span>MOQ:<b>${fmtQty(c.moq)}</b></span>` : '<span>MOQ:未设置</span>'}</div>
+          ${c.material_name ? `<div class="li-row"><span>物料名:<b>${esc(c.material_name)}</b></span></div>` : ''}
+          <div class="li-row"><span>品类:${esc(c.category || '-')}</span><span>单位:${esc(c.unit || '个')}</span></div>
+          <div class="li-row"><span>入库时间:${esc(c.last_in_date || '暂无入库')}</span><span>最近领用:-</span>${low ? '' : ''}</div>
+          <div class="li-row" style="margin-top:6px"><span style="font-size:18px">库存 <b style="font-size:18px;color:${low ? 'var(--red)' : 'var(--green)'}">${fmtQty(c.stock)}</b> ${esc(c.unit || '个')}</span></div>
+          ${isAdmin() ? `<div class="li-actions">
+            <a class="btn tiny green" href="#/stock-io?type=in&id=${c.id}">入库</a>
+            <a class="btn tiny ghost" href="#/stock-io?type=out&id=${c.id}">出库</a>
+            <button class="btn tiny ghost" data-act="edit" data-id="${c.id}">编辑</button>
+            <button class="btn tiny ghost" data-act="del" data-id="${c.id}" style="color:var(--red)">删除</button>
+          </div>` : ''}
+        </div>`;
+      }).join('');
+      if (isAdmin()) {
+        listEl.querySelectorAll('[data-act]').forEach(b => b.onclick = async () => {
+          const id = b.dataset.id, act = b.dataset.act;
+          const c = r.list.find(x => x.id === id);
+          if (act === 'edit') return consumableForm(c, load);
+          if (act === 'del') {
+            if (!(await confirmBox(`确定删除「${c.name}」？`, true))) return;
+            try { await api(`/consumables/${id}`, { method: 'DELETE' }); toast('已删除'); load(); }
+            catch (e) { toast(e.message, true); }
+          }
+        });
+        if ($('#c-add')) $('#c-add').onclick = () => consumableForm(null, load);
+      }
+    } catch (e) { listEl.innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
+  };
+  $('#c-search').onclick = load;
+  $('#c-q').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
+  load();
+}
+function consumableForm(c, onDone) {
+  const isEdit = !!c;
+  const wrap = el('div');
+  wrap.innerHTML = `
+    <div class="field"><label class="req">包材编码</label><input class="inp" id="f-code" value="${c ? esc(c.name) : ''}"></div>
+    <div class="field"><label>物料名称</label><input class="inp" id="f-mname" value="${c ? esc(c.material_name || '') : ''}"></div>
+    <div class="field"><label>分类</label>
+      <select class="inp" id="f-cat">
+        ${['未分类','彩盒','封口贴','其他','包材','中文标签','自定义'].map(k => `<option ${c && c.category === k ? 'selected' : ''}>${k}</option>`).join('')}
+      </select></div>
+    <div class="field"><label>单位</label><input class="inp" id="f-unit" value="${c ? esc(c.unit || '个') : '个'}"></div>
+    ${isAdmin() ? `<div class="field"><label class="req">现有数量</label><input class="inp" id="f-stock" type="number" value="${c ? c.stock : 0}"><div style="font-size:11px;color:var(--muted);margin-top:3px">管理员可直接校准库存数量</div></div>` : ''}
+    <div class="field"><label>货架号 / 储位号</label><input class="inp" id="f-shelf" value="${c ? esc(c.shelf_code || '') : ''}" placeholder="如 HC-03-02-001"></div>
+    <div class="field"><label class="req">安全库存预警值</label><input class="inp" id="f-safety" type="number" value="${c ? c.safety_stock : 0}"><div style="font-size:11px;color:var(--muted);margin-top:3px">库存低于该值将预警</div></div>
+    <div class="field"><label>最小起订量 MOQ</label><input class="inp" id="f-moq" type="number" value="${c ? (c.moq || 0) : 0}"><div style="font-size:11px;color:var(--muted);margin-top:3px">留空或0按默认1000取整</div></div>
+    <button class="btn primary" id="f-save" style="margin-top:6px">保存修改</button>`;
+  const mask = showSheet(isEdit ? '编辑耗材信息' : '新增耗材', wrap);
+  $('#f-save').onclick = async () => {
+    const body = {
+      name: trim($('#f-code').value), material_name: trim($('#f-mname').value), category: $('#f-cat').value,
+      unit: trim($('#f-unit').value), stock: Number($('#f-stock')?.value ?? (c ? c.stock : 0)),
+      shelf_code: trim($('#f-shelf').value), safety_stock: Number($('#f-safety').value) || 0, moq: Number($('#f-moq').value) || 0,
+    };
+    if (!body.name) return toast('包材编码不能为空', true);
+    try {
+      await api('/consumables' + (isEdit ? `/${c.id}` : ''), { method: isEdit ? 'PUT' : 'POST', body });
+      toast(isEdit ? '已更新' : '新增成功'); mask.remove(); onDone && onDone();
+    } catch (e) { toast(e.message, true); }
+  };
+}
+
+/* ===== 出入库登记 ===== */
+async function renderStockIO(container, query) {
+  const type = query.type === 'out' ? 'out' : 'in';
+  container.innerHTML = navbar(type === 'in' ? '入库登记' : '出库登记', true) + `
+  <div class="page-body">
+    <div class="segment"><button class="${type === 'in' ? 'on' : ''}" onclick="location.hash='#/stock-io?type=in'">+ 入库</button><button class="${type === 'out' ? 'on' : ''}" onclick="location.hash='#/stock-io?type=out'">− 出库</button></div>
+    <div class="card" id="io-form"><div class="loading">加载中...</div></div>
+  </div>`;
+  // 耗材搜索选择
+  const wrap = $('#io-form');
+  wrap.innerHTML = `
+    <div class="field"><label class="req">耗材 / 包材编码</label>
+      <div class="input-group"><span class="ig-ico">🔎</span><input id="io-code" placeholder="输入编码搜索"><button class="btn tiny ghost" id="io-pick">搜索</button></div>
+      <div id="io-picked" style="margin-top:8px"></div></div>
+    <div class="field"><label class="req">${type === 'in' ? '入库' : '出库'}数量</label><input class="inp" id="io-qty" type="number" min="0.01" step="any"></div>
+    <div class="field"><label>储位编码（引导前往核对）</label>
+      <div class="input-group"><span class="ig-ico">📍</span><input id="io-shelf" placeholder="储位编码"></div></div>
+    ${type === 'out' ? `
+    <div class="field"><label>领用人</label><input class="inp" id="io-receiver" placeholder="领用人"></div>
+    <div class="field"><label>用途/备注</label><textarea class="inp" id="io-reason" placeholder="用途/备注"></textarea></div>` : `
+    <div class="field"><label>备注</label><input class="inp" id="io-reason" placeholder="备注"></div>`}
+    <div class="field"><label>日期</label><input class="inp" id="io-date" type="date"></div>
+    <button class="btn ${type === 'in' ? 'primary' : 'danger'}" id="io-submit">确认${type === 'in' ? '入库' : '出库'}</button>`;
+  $('#io-date').value = new Date().toISOString().slice(0, 10);
+  let picked = null;
+  const pickSearch = async () => {
+    const q = trim($('#io-code').value);
+    if (!q) return toast('请输入编码搜索', true);
+    try {
+      const r = await api('/consumables?q=' + encodeURIComponent(q));
+      const area = $('#io-picked');
+      if (!r.list.length) { area.innerHTML = '<div style="font-size:12px;color:var(--muted)">未找到，请确认编码</div>'; return; }
+      area.innerHTML = r.list.slice(0, 5).map(c => `
+        <div class="sub-item" data-id="${c.id}" style="border:1px solid var(--border);border-radius:10px;margin-bottom:6px">
+          <div class="s-text"><div class="s-name">${esc(c.name)} ${c.material_name ? '<span style="color:var(--muted);font-weight:400;font-size:11px">'+esc(c.material_name)+'</span>' : ''}</div>
+          <div class="s-desc">库存 ${fmtQty(c.stock)} ${esc(c.unit)} · 储位 ${esc(c.shelf_code || '-')}</div></div>
+        </div>`).join('');
+      area.querySelectorAll('[data-id]').forEach(n => n.onclick = () => {
+        picked = r.list.find(x => x.id === n.dataset.id);
+        $('#io-code').value = picked.name;
+        $('#io-shelf').value = picked.shelf_code || '';
+        area.innerHTML = `<div style="display:flex;align-items:center;gap:8px;background:var(--primary-soft);padding:8px 10px;border-radius:10px">
+          <span style="font-size:13px">✅ 已选：<b>${esc(picked.name)}</b>（库存 ${fmtQty(picked.stock)}=${esc(picked.unit)}，安全库存 ${fmtQty(picked.safety_stock)}）</span>
+          <button class="btn tiny ghost" id="io-clear" style="margin-left:auto">重选</button></div>`;
+        $('#io-clear').onclick = () => { picked = null; area.innerHTML = ''; };
+      });
+    } catch (e) { toast(e.message, true); }
+  };
+  $('#io-pick').onclick = pickSearch;
+  $('#io-code').addEventListener('keydown', e => { if (e.key === 'Enter') pickSearch(); });
+  // 带参直接选定
+  if (query.id) {
+    try {
+      const r = await api('/consumables');
+      const c = r.list.find(x => x.id === query.id);
+      if (c) { picked = c; $('#io-code').value = c.name; $('#io-shelf').value = c.shelf_code || '';
+        $('#io-picked').innerHTML = `<div style="background:var(--primary-soft);padding:8px 10px;border-radius:10px;font-size:13px">✅ 已选：<b>${esc(c.name)}</b>（库存 ${fmtQty(c.stock)} ${esc(c.unit)}）</div>`; }
+    } catch {}
+  }
+  $('#io-submit').onclick = async () => {
+    const qty = Number($('#io-qty').value);
+    if (!picked) return toast('请先搜索并选择耗材', true);
+    if (!qty || qty <= 0) return toast('请输入正确数量', true);
+    try {
+      await api('/stock-io', { method: 'POST', body: {
+        consumable_id: picked.id, qty, reason: trim($('#io-reason').value) || (type === 'out' ? trim($('#io-receiver').value) + ' 领用' : ''),
+        record_date: $('#io-date').value, type, shelf_code: trim($('#io-shelf').value),
+      }});
+      toast(type === 'in' ? '✅ 入库成功' : '✅ 出库成功');
+      picked = null; $('#io-qty').value = ''; $('#io-picked').innerHTML = '';
+    } catch (e) { toast(e.message, true); }
+  };
+}
+
+/* ===== 实物库存查询 ===== */
+async function renderFGStock(container) {
+  container.innerHTML = navbar('实物库存查询', true) + `
+  <div class="page-body">
+    <div class="search-bar"><input class="inp" id="fg-q" placeholder="SKU / 储位号"><button class="btn primary" id="fg-search">搜索</button></div>
+    <div id="fg-stats"><div class="loading">加载中...</div></div>
+    <div class="filter-row" id="fg-zone">
+      <button class="chip active" data-v="">全部储区</button>
+      <button class="chip" data-v="AA">AA(拣货)</button>
+      <button class="chip" data-v="AB">AB(成品)</button>
+      <button class="chip" data-v="AC">AC(分货)</button>
+    </div>
+    <div id="fg-list"></div>
+  </div>`;
+  let zone = '';
+  const load = async () => {
+    const listEl = $('#fg-list'), statEl = $('#fg-stats');
+    listEl.innerHTML = '<div class="loading">加载中...</div>';
+    try {
+      const params = new URLSearchParams();
+      const q = trim($('#fg-q').value);
+      if (q) params.set('q', q);
+      if (zone) params.set('zone', zone);
+      let r;
+      if (isCloud()) {
+        // 云端模式：并行查主表 + 高架明细，聚合成与后端相同结构
+        const ors = [];
+        if (q) [`sku=ilike.*${q}*`, `ground_location=ilike.*${q}*`, `high_shelf_location=ilike.*${q}*`, `pick_location=ilike.*${q}*`].forEach(c => ors.push(c));
+        let filter = ors.length ? 'or=(' + ors.join(',') + ')' : '';
+        if (zone) {
+          const zf = `or=(ground_location=like.${zone}-*,high_shelf_location=like.${zone}-*,pick_location=like.${zone}-*)`;
+          filter = filter ? filter + '&' + zf : zf;
+        }
+        const list = await supa.rest('finished_goods_stock', { select: 'sku,system_stock,ground_location,ground_quantity,high_shelf_location,high_shelf_quantity,pick_location,pick_quantity,new_quantity', filter, order: 'sku', limit: 500 });
+        const allSkus = list.map(x => `sku=eq.${x.sku}`).join(',');
+        const highRows = await supa.rest('finished_goods_stock_high_shelves', { select: 'sku,location,quantity', filter: allSkus ? 'or=(' + allSkus + ')' : 'sku=eq.__none__', order: 'created_at' });
+        const highMap = {};
+        highRows.forEach(h => { (highMap[h.sku] = highMap[h.sku] || []).push({ location: h.location, quantity: h.quantity }); });
+        const sum = (a, k) => a.reduce((s, x) => s + (Number(x[k]) || 0), 0);
+        const fullList = list.length === 500 ? [] : list; // 简化：云端搜索模式下统计基于当前结果
+        r = {
+          list,
+          highMap,
+          stats: {
+            totalSkus: list.length, zeroSkus: list.filter(f => (Number(f.ground_quantity) || 0) + (Number(f.high_shelf_quantity) || 0) + (Number(f.pick_quantity) || 0) === 0).length,
+            totalQty: sum(list, 'ground_quantity') + sum(list, 'high_shelf_quantity') + sum(list, 'pick_quantity'),
+            newQty: sum(list, 'new_quantity'),
+            groundQty: sum(list, 'ground_quantity'), highQty: sum(list, 'high_shelf_quantity'), pickQty: sum(list, 'pick_quantity'),
+          },
+        };
+      } else {
+        r = await api('/finished-goods?' + params.toString());
+      }
+      const s = r.stats;
+      statEl.innerHTML = `
+      <div class="stat-grid">
+        <div class="stat-card"><div class="label">📦 实物在库 SKU</div><div class="value">${fmtQty(s.totalSkus)}</div><div class="sub">零库存 ${fmtQty(s.zeroSkus)} 款</div></div>
+        <div class="stat-card"><div class="label">📊 逆向总库存</div><div class="value">${fmtQty(s.totalQty)}</div><div class="sub">地堆 ${fmtQty(s.groundQty)} · 高架 ${fmtQty(s.highQty)} · 拣货 ${fmtQty(s.pickQty)}</div></div>
+      </div>
+      <div class="stat-card" style="margin-bottom:12px;background:linear-gradient(135deg,#f0fdf4,#dcfce7)"><div class="label">✨ 全新品</div><div class="value" style="color:var(--green)">${fmtQty(s.newQty)}</div></div>`;
+      if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>未找到库存记录</div>';
+      listEl.innerHTML = r.list.map(f => {
+        const highs = (r.highMap[f.sku] || []);
+        const phy = (Number(f.ground_quantity) || 0) + (Number(f.high_shelf_quantity) || 0) + (Number(f.pick_quantity) || 0);
+        const sys = Number(f.system_stock || 0);
+        const low = phy > 0 && sys < phy;
+        // 账实差异提示（用户确认的商家常态：差异≥10 且 ≥系统数20% 时标提示）
+        const gap = phy - sys;
+        const gapBig = phy > 0 && Math.abs(gap) >= 10 && Math.abs(gap) >= Math.abs(sys) * 0.2;
+        return `
+        <div class="list-item">
+          <div class="li-head"><span class="li-name">${esc(f.sku)}</span>
+            <span style="display:flex;gap:5px;align-items:center">
+              ${gapBig ? `<span class="badge" style="background:#fff7ed;color:#c2410c" onclick="location.hash='#/stock-gap'" title="系统数与实物数差距较大，点开看差异清单">⚠️ 账实差 ${fmtQty(gap > 0 ? '+' + gap : gap)}</span>` : ''}
+              ${f.new_quantity > 0 ? '<span class="badge teal">全新品 ' + fmtQty(f.new_quantity) + '</span>' : ''}
+              <span style="font-size:13px;font-weight:700">${low ? '<span style="color:var(--red)">' + fmtQty(phy) + '</span>' : fmtQty(phy)}</span>
+            </span></div>
+          <div class="li-row"><span>系统库存:<b>${fmtQty(Number(f.system_stock) || 0)}</b></span></div>
+          <div class="li-row"><span>地堆位 <b>${f.ground_location ? esc(f.ground_location) : '-'}</b> · ${fmtQty(f.ground_quantity)}</span></div>
+          ${highs.length ? highs.map((h, i) => `<div class="li-row"><span>高架位${highs.length > 1 ? i + 1 : ''} <b>${esc(h.location)}</b> · ${fmtQty(h.quantity)}</span></div>`).join('') :
+            `<div class="li-row"><span>高架位 - · ${fmtQty(f.high_shelf_quantity)}</span></div>`}
+          <div class="li-row"><span>拣货位 <b>${f.pick_location ? esc(f.pick_location) : '-'}</b> · ${fmtQty(f.pick_quantity)}</span></div>
+        </div>`;
+      }).join('');
+    } catch (e) { listEl.innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
+  };
+  $('#fg-search').onclick = load;
+  $('#fg-q').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
+  $('#fg-zone').querySelectorAll('.chip').forEach(ch => ch.onclick = () => {
+    zone = ch.dataset.v;
+    $('#fg-zone').querySelectorAll('.chip').forEach(x => x.classList.toggle('active', x === ch));
+    load();
+  });
+  load();
+}
+
+/* ===== 上架作业 ===== */
+async function renderPutaway(container) {
+  container.innerHTML = navbar('上架作业', true) + `
+  <div class="page-body">
+    <div class="card">
+      <div style="display:flex;gap:10px;align-items:flex-start;margin-bottom:14px">
+        <div style="width:26px;height:26px;border-radius:50%;background:var(--primary);color:#fff;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;flex-shrink:0">1</div>
+        <div style="flex:1"><div style="font-weight:700;margin-bottom:8px">扫描商品SKU条码</div>
+          <div class="input-group"><span class="ig-ico">📦</span><input id="pa-sku" placeholder="输入 SKU"><button class="btn tiny primary" id="pa-query">查询</button></div>
+          <div id="pa-info" style="margin-top:8px"></div></div>
+      </div>
+      <div style="display:flex;gap:10px;align-items:flex-start;margin-bottom:14px">
+        <div style="width:26px;height:26px;border-radius:50%;background:var(--primary);color:#fff;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;flex-shrink:0">3</div>
+        <div style="flex:1"><div style="font-weight:700;margin-bottom:8px">扫描储位并提交</div>
+          <div class="input-group"><span class="ig-ico">📍</span><input id="pa-loc" placeholder="目标储位"></div>
+          <div id="pa-loctype" style="margin-top:6px;font-size:12px"></div>
+          <div class="field" style="margin-top:10px"><label class="req">本次上架数量</label><input class="inp" id="pa-qty" type="number" min="1"></div>
+          <button class="btn primary" id="pa-submit">提交上架</button></div>
+      </div>
+    </div>
+    <div style="font-size:12px;color:var(--muted-foreground);line-height:1.7;padding:0 4px">储位规则：拣货位执行一品一位；地堆位、高架位允许多个SKU共存。储位推荐仅作参考，可自由切换。</div>
+  </div>`;
+  let fg = null;
+  const querySku = async () => {
+    const sku = trim($('#pa-sku').value);
+    if (!sku) return toast('请输入 SKU', true);
+    try {
+      const r = await api('/finished-goods?q=' + encodeURIComponent(sku));
+      fg = r.list.find(x => x.sku === sku) || null;
+      const info = $('#pa-info');
+      if (fg) {
+        info.innerHTML = `<div style="background:var(--green-soft);padding:9px 11px;border-radius:10px;font-size:12px;line-height:1.7">
+          ✅ <b>${esc(fg.sku)}</b> · 系统库存 ${fmtQty(Number(fg.system_stock) || 0)}<br>
+          现有：地堆 ${fmtQty(fg.ground_quantity)}${fg.ground_location ? '(' + esc(fg.ground_location) + ')' : ''} · 高架 ${fmtQty(fg.high_shelf_quantity)} · 拣货 ${fmtQty(fg.pick_quantity)} · 全新品 ${fmtQty(fg.new_quantity)}</div>`;
+      } else {
+        info.innerHTML = `<div style="background:var(--orange-soft);padding:9px 11px;border-radius:10px;font-size:12px">⚠️ 未找到 ${esc(sku)}，上架将自动建档</div>`;
+        fg = { sku, isNew: true };
+      }
+    } catch (e) { toast(e.message, true); }
+  };
+  $('#pa-query').onclick = querySku;
+  $('#pa-sku').addEventListener('keydown', e => { if (e.key === 'Enter') querySku(); });
+  $('#pa-loc').addEventListener('input', () => {
+    const v = trim($('#pa-loc').value);
+    const tip = $('#pa-loctype');
+    if (!v) return tip.innerHTML = '';
+    let t = '';
+    if (v.startsWith('AA-')) t = '已识别为<b>拣货位</b>（一品一位）';
+    else if (v.startsWith('AB-')) t = /^AB-\d+-\d+-\d+$/.test(v) ? '已识别为<b>高架位</b>（可多SKU共存）' : '已识别为<b>地堆位</b>（可多SKU共存）';
+    else t = '无法识别储位类型，请检查编码';
+    tip.innerHTML = t;
+  });
+  $('#pa-submit').onclick = async () => {
+    const sku = trim($('#pa-sku').value), loc = trim($('#pa-loc').value), qty = Number($('#pa-qty').value);
+    if (!sku || !loc) return toast('请输入 SKU 和储位', true);
+    if (!qty || qty <= 0) return toast('请输入上架数量', true);
+    try {
+      const r = await api('/putaway', { method: 'POST', body: { sku, location: loc, qty } });
+      toast(`✅ 上架成功（${r.locType === 'ground' ? '地堆位' : r.locType === 'high' ? '高架位' : '拣货位'}）`);
+      $('#pa-sku').value = ''; $('#pa-loc').value = ''; $('#pa-qty').value = '';
+      $('#pa-info').innerHTML = ''; $('#pa-loctype').innerHTML = ''; fg = null;
+    } catch (e) { toast(e.message, true); }
+  };
+}
+
+/* ===== 拣货出库 ===== */
+async function renderFGPicking(container) {
+  container.innerHTML = navbar('拣货出库', true) + `
+  <div class="page-body">
+    <div class="card">
+      <div class="field"><label class="req">SKU</label>
+        <div class="input-group"><span class="ig-ico">📦</span><input id="pk-sku" placeholder="输入 SKU"><button class="btn tiny primary" id="pk-query">查询</button></div></div>
+      <div id="pk-info" style="margin-bottom:12px"></div>
+      <div class="field"><label class="req">出库数量</label><input class="inp" id="pk-qty" type="number" min="1"></div>
+      <div class="field"><label class="req">出库储位</label>
+        <div class="input-group"><span class="ig-ico">📍</span><input id="pk-loc" placeholder="选择或输入储位"></div>
+        <div id="pk-locs" style="margin-top:8px"></div></div>
+      <div class="field"><label>性质</label>
+        <select class="inp" id="pk-nature"><option value="不良品">不良品</option><option value="全新品">全新品</option></select></div>
+      <button class="btn danger" id="pk-submit">确认出库</button>
+    </div>
+  </div>`;
+  let fg = null;
+  const querySku = async () => {
+    const sku = trim($('#pk-sku').value);
+    if (!sku) return toast('请输入 SKU', true);
+    try {
+      const r = await api('/finished-goods?q=' + encodeURIComponent(sku));
+      fg = r.list.find(x => x.sku === sku) || null;
+      const info = $('#pk-info');
+      if (!fg) { info.innerHTML = '<div style="color:var(--red);font-size:13px">❌ SKU 不存在</div>'; return; }
+      const highs = r.highMap[fg.sku] || [];
+      info.innerHTML = `<div style="background:var(--orange-soft);padding:9px 11px;border-radius:10px;font-size:12px;line-height:1.7">
+        <b>${esc(fg.sku)}</b> · 系统库存 ${fmtQty(Number(fg.system_stock) || 0)} · 可出库实物 ${fmtQty((Number(fg.ground_quantity)||0)+(Number(fg.high_shelf_quantity)||0)+(Number(fg.pick_quantity)||0))}</div>`;
+      // 储位选项
+      const locs = [];
+      if (fg.ground_quantity > 0 && fg.ground_location) locs.push({ loc: fg.ground_location, q: fg.ground_quantity, type: '地堆位' });
+      highs.forEach(h => locs.push({ loc: h.location, q: h.quantity, type: '高架位' }));
+      if (fg.pick_quantity > 0 && fg.pick_location) locs.push({ loc: fg.pick_location, q: fg.pick_quantity, type: '拣货位' });
+      $('#pk-locs').innerHTML = locs.length ? locs.map(l => `
+        <div class="sub-item" data-loc="${esc(l.loc)}" style="border:1px solid var(--border);border-radius:10px;margin-bottom:6px">
+          <div class="s-text"><div class="s-name">${l.type} · ${esc(l.loc)}</div><div class="s-desc">可出 ${fmtQty(l.q)} 件</div></div>
+        </div>`).join('') : '<div style="font-size:12px;color:var(--muted)">无可出库储位</div>';
+      $('#pk-locs').querySelectorAll('[data-loc]').forEach(n => n.onclick = () => {
+        $('#pk-loc').value = n.dataset.loc;
+        $('#pk-locs').querySelectorAll('.sub-item').forEach(x => x.style.borderColor = 'var(--border)');
+        n.style.borderColor = 'var(--primary)';
+      });
+    } catch (e) { toast(e.message, true); }
+  };
+  $('#pk-query').onclick = querySku;
+  $('#pk-sku').addEventListener('keydown', e => { if (e.key === 'Enter') querySku(); });
+  $('#pk-submit').onclick = async () => {
+    const sku = trim($('#pk-sku').value), loc = trim($('#pk-loc').value), qty = Number($('#pk-qty').value);
+    if (!sku || !loc || !qty || qty <= 0) return toast('请完整填写 SKU、储位、数量', true);
+    if (!(await confirmBox(`确认出库 ${sku} × ${qty}（储位 ${loc}）？`))) return;
+    try {
+      const r = await api('/fg-picking', { method: 'POST', body: { sku, location: loc, qty, nature: $('#pk-nature').value } });
+      toast(`✅ 出库成功，单号 ${r.batchNo.slice(0, 20)}...`);
+      $('#pk-sku').value = ''; $('#pk-loc').value = ''; $('#pk-qty').value = ''; $('#pk-info').innerHTML = ''; $('#pk-locs').innerHTML = '';
+    } catch (e) { toast(e.message, true); }
+  };
+}
+
+/* ===== 逆向移库 ===== */
+async function renderTransfer(container) {
+  container.innerHTML = navbar('逆向移库', true) + `
+  <div class="page-body">
+    <div class="card">
+      <div class="field"><label class="req">SKU</label>
+        <div class="input-group"><span class="ig-ico">📦</span><input id="tr-sku" placeholder="输入 SKU"><button class="btn tiny primary" id="tr-query">查询</button></div></div>
+      <div id="tr-info" style="margin-bottom:12px"></div>
+      <div class="field"><label class="req">源储位</label>
+        <div id="tr-from-list"></div></div>
+      <div class="field"><label class="req">目标储位</label><input class="inp" id="tr-to" placeholder="目标储位编码"></div>
+      <div class="field"><label class="req">移库数量</label><input class="inp" id="tr-qty" type="number" min="1"></div>
+      <button class="btn primary" id="tr-submit">确认移库</button>
+    </div>
+  </div>`;
+  let fg = null, highs = [], fromLoc = '';
+  const querySku = async () => {
+    const sku = trim($('#tr-sku').value);
+    if (!sku) return toast('请输入 SKU', true);
+    try {
+      const r = await api('/finished-goods?q=' + encodeURIComponent(sku));
+      fg = r.list.find(x => x.sku === sku) || null;
+      highs = r.highMap[sku] || [];
+      const info = $('#tr-info');
+      if (!fg) { info.innerHTML = '<div style="color:var(--red);font-size:13px">❌ SKU 不存在</div>'; $('#tr-from-list').innerHTML = ''; return; }
+      const locs = [];
+      if (fg.ground_quantity > 0 && fg.ground_location) locs.push({ loc: fg.ground_location, q: fg.ground_quantity, type: '地堆位' });
+      highs.forEach(h => locs.push({ loc: h.location, q: h.quantity, type: '高架位' }));
+      if (fg.pick_quantity > 0 && fg.pick_location) locs.push({ loc: fg.pick_location, q: fg.pick_quantity, type: '拣货位' });
+      info.innerHTML = `<div style="background:var(--primary-soft);padding:9px 11px;border-radius:10px;font-size:12px"><b>${esc(fg.sku)}</b> · 系统库存 ${fmtQty(Number(fg.system_stock) || 0)}</div>`;
+      $('#tr-from-list').innerHTML = locs.length ? locs.map(l => `
+        <div class="sub-item" data-loc="${esc(l.loc)}" style="border:1px solid var(--border);border-radius:10px;margin-bottom:6px">
+          <div class="s-text"><div class="s-name">${l.type} · ${esc(l.loc)}</div><div class="s-desc">现有 ${fmtQty(l.q)} 件</div></div>
+        </div>`).join('') : '<div style="font-size:12px;color:var(--muted)">无可移库储位</div>';
+      $('#tr-from-list').querySelectorAll('[data-loc]').forEach(n => n.onclick = () => {
+        fromLoc = n.dataset.loc;
+        $('#tr-from-list').querySelectorAll('.sub-item').forEach(x => x.style.borderColor = 'var(--border)');
+        n.style.borderColor = 'var(--primary)';
+      });
+    } catch (e) { toast(e.message, true); }
+  };
+  $('#tr-query').onclick = querySku;
+  $('#tr-submit').onclick = async () => {
+    const sku = trim($('#tr-sku').value), to = trim($('#tr-to').value), qty = Number($('#tr-qty').value);
+    if (!sku || !fromLoc || !to || !qty || qty <= 0) return toast('请完整填写', true);
+    try {
+      await api('/transfer', { method: 'POST', body: { sku, from_location: fromLoc, to_location: to, qty } });
+      toast('✅ 移库成功');
+      $('#tr-sku').value = ''; $('#tr-to').value = ''; $('#tr-qty').value = ''; fromLoc = '';
+      $('#tr-info').innerHTML = ''; $('#tr-from-list').innerHTML = '';
+    } catch (e) { toast(e.message, true); }
+  };
+}
+
+/* ===== 翻新匹配统计 ===== */
+async function renderRenoStats(container) {
+  container.innerHTML = navbar('翻新匹配统计', true) + `
+  <div class="page-body" id="rs-body"><div class="loading">加载中...</div></div>`;
+  try {
+    const r = await api('/renovation-stats');
+    $('#rs-body').innerHTML = `
+    <div class="card" style="font-size:12px;color:var(--muted-foreground);line-height:1.8">
+      <div style="font-weight:700;color:var(--foreground);margin-bottom:6px">📊 匹数逻辑说明</div>
+      <div><b>数据基准：</b>仅以「不良品实物库存」为基准（拣货位+地堆位+高架位），严格排除全新品虚拟储区。</div>
+      <div><b>待翻新数：</b>= Σ min(系统库存, 实物库存)，已剔除「不翻新 / 无需翻新」SKU。</div>
+      <div><b>可翻新数：</b>= Σ 每个SKU可拣货量（实物/系统/彩盒/中文标签取最小）。</div>
+      <div><b>无法翻新数：</b>= max(0, 待翻新 − 可翻新)。</div>
+      <div><b>剩余实物：</b>未纳入翻新需求的实物。</div>
+    </div>
+    <div class="stat-grid cols-3">
+      <div class="stat-card" style="background:linear-gradient(135deg,#fef2f2,#fee2e2)"><div class="label">待翻新数</div><div class="value" style="color:var(--red)">${fmtQty(r.pending)}</div></div>
+      <div class="stat-card" style="background:linear-gradient(135deg,#f0fdf4,#dcfce7)"><div class="label">可翻新数</div><div class="value" style="color:var(--green)">${fmtQty(r.canRenovate)}</div></div>
+      <div class="stat-card"><div class="label">无法翻新数</div><div class="value">${fmtQty(r.cannotRenovate)}</div></div>
+      <div class="stat-card"><div class="label">不翻新数量</div><div class="value">${fmtQty(r.noRenoQty)}</div></div>
+      <div class="stat-card"><div class="label">剩余实物</div><div class="value">${fmtQty(r.remaining)}</div></div>
+    </div>
+    <div class="warn-bar">💡 ${esc(r.note)}</div>`;
+  } catch (e) { $('#rs-body').innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
+}
+
+/* ===== 翻新后库存查询 ===== */
+async function renderRenoInventory(container) {
+  container.innerHTML = navbar('翻新后库存查询', true) + `
+  <div class="page-body">
+    <div class="search-bar"><input class="inp" id="ri-q" placeholder="SKU / 储位号"><button class="btn primary" id="ri-search">搜索</button></div>
+    <div class="filter-row" id="ri-status">
+      <button class="chip active" data-v="">全部状态</button><button class="chip" data-v="翻新成功">翻新成功</button><button class="chip" data-v="翻新失败">翻新失败</button>
+    </div>
+    <div class="filter-row" id="ri-stage">
+      <button class="chip active" data-v="">全部阶段</button><button class="chip" data-v="搬仓前">搬仓前</button><button class="chip" data-v="搬仓后">搬仓后</button>
+    </div>
+    <div id="ri-list"><div class="loading">加载中...</div></div>
+  </div>`;
+  let status = '', stage = '';
+  const load = async () => {
+    const listEl = $('#ri-list');
+    listEl.innerHTML = '<div class="loading">加载中...</div>';
+    try {
+      const params = new URLSearchParams();
+      const q = trim($('#ri-q').value);
+      if (q) params.set('q', q);
+      if (status) params.set('status', status);
+      if (stage) params.set('stage', stage);
+      const r = await api('/renovation-inventory?' + params.toString());
+      if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无库存</div>';
+      listEl.innerHTML = r.list.map(x => `
+      <div class="list-item">
+        <div class="li-head"><span class="li-name">${esc(x.sku)}</span>
+          <span style="display:flex;gap:5px;align-items:center">
+            ${x.status === '翻新成功' ? '<span class="badge green">翻新成功</span>' : x.status === '翻新失败' ? '<span class="badge red">翻新失败</span>' : ''}
+            <span style="font-size:13px;font-weight:700">${fmtQty(x.quantity)}</span></span></div>
+        <div class="li-row"><span>储位:<b>${esc(x.shelf_no || '-')}</b></span><span>成色:${esc(x.condition || '-')}</span></div>
+        <div class="li-row"><span>阶段:${esc(x.stage || '-')}</span><span>渠道:${esc(x.channel || '-')}</span>${x.belong_month ? `<span>归属:${esc(x.belong_month)}</span>` : ''}</div>
+      </div>`).join('');
+    } catch (e) { listEl.innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
+  };
+  $('#ri-search').onclick = load;
+  $('#ri-q').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
+  $('#ri-status').querySelectorAll('.chip').forEach(ch => ch.onclick = () => {
+    status = ch.dataset.v;
+    $('#ri-status').querySelectorAll('.chip').forEach(x => x.classList.toggle('active', x === ch)); load();
+  });
+  $('#ri-stage').querySelectorAll('.chip').forEach(ch => ch.onclick = () => {
+    stage = ch.dataset.v;
+    $('#ri-stage').querySelectorAll('.chip').forEach(x => x.classList.toggle('active', x === ch)); load();
+  });
+  load();
+}
+
+/* ===== 拆包统计 ===== */
+async function renderUnpackStats(container) {
+  container.innerHTML = navbar('拆包统计', true) + `
+  <div class="page-body">
+    <div class="card">
+      <div style="display:flex;gap:8px">
+        <div class="field" style="flex:1"><label>开始日期</label><input class="inp" id="up-from" type="date"></div>
+        <div class="field" style="flex:1"><label>结束日期</label><input class="inp" id="up-to" type="date"></div>
+      </div>
+      <button class="btn primary" id="up-search">查 询</button>
+    </div>
+    <div id="up-body"><div class="loading">加载中...</div></div>
+  </div>`;
+  const load = async () => {
+    const params = new URLSearchParams();
+    if ($('#up-from').value) params.set('from', $('#up-from').value);
+    if ($('#up-to').value) params.set('to', $('#up-to').value);
+    const body = $('#up-body');
+    body.innerHTML = '<div class="loading">加载中...</div>';
+    try {
+      const r = await api('/unpacking/stats?' + params.toString());
+      body.innerHTML = `
+      <div class="stat-grid">
+        <div class="stat-card"><div class="label">✂️ 拆包总单数</div><div class="value">${fmtQty(r.total.cnt)}</div></div>
+        <div class="stat-card"><div class="label">📦 拆包总件数</div><div class="value" style="color:var(--green)">${fmtQty(Math.round(r.total.qty))}</div></div>
+      </div>
+      <div class="section-title">📊 按录入人汇总</div>
+      ${r.byWorker.map(w => `
+      <div class="list-item">
+        <div class="li-head"><span class="li-name">${esc(w.worker_name)}</span>
+          <span style="font-size:15px;font-weight:700;color:var(--green)">${fmtQty(Math.round(w.qty))} 件</span></div>
+        <div class="li-row"><span>单数:<b>${fmtQty(w.cnt)}</b></span><span>均单产:${w.cnt ? (w.qty / w.cnt).toFixed(1) : 0} 件</span></div>
+      </div>`).join('')}`;
+    } catch (e) { body.innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
+  };
+  $('#up-search').onclick = load;
+  load();
+}
+
+/* ===== 热度标签 ===== */
+async function renderHeatLabels(container) {
+  container.innerHTML = navbar('热度标签管理', true) + `
+  <div class="page-body">
+    <div class="search-bar"><input class="inp" id="hl-q" placeholder="搜索 SKU"><button class="btn primary" id="hl-search">搜索</button></div>
+    <div class="filter-row" id="hl-filter">
+      <button class="chip active" data-v="">全部</button><button class="chip" data-v="hot">🔥 爆品</button><button class="chip" data-v="normal">常规</button><button class="chip" data-v="cold">❄️ 淡品</button>
+    </div>
+    <div id="hl-list"><div class="loading">加载中...</div></div>
+  </div>`;
+  let label = '';
+  const LABEL_BADGE = { hot: '<span class="badge red">🔥 爆品</span>', normal: '<span class="badge gray">常规</span>', cold: '<span class="badge teal">❄️ 淡品</span>' };
+  const load = async () => {
+    const listEl = $('#hl-list');
+    listEl.innerHTML = '<div class="loading">加载中...</div>';
+    try {
+      const params = new URLSearchParams();
+      const q = trim($('#hl-q').value);
+      if (q) params.set('q', q);
+      if (label) params.set('label', label);
+      const r = await api('/heat-labels?' + params.toString());
+      if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无标签</div>';
+      listEl.innerHTML = r.list.map(x => `
+      <div class="list-item">
+        <div class="li-head"><span class="li-name">${esc(x.sku)}</span>${LABEL_BADGE[x.label] || ''}</div>
+        <div class="li-row"><span>近7日入库:<b>${fmtQty(x.last_7d_inbound)}</b></span><span>昨日入库:<b>${fmtQty(x.yesterday_inbound)}</b></span><span>总库存:<b>${fmtQty(x.total_stock)}</b></span></div>
+        ${x.is_manual ? '<div class="li-row"><span style="color:var(--orange)">✋ 手动设定</span></div>' : ''}
+      </div>`).join('');
+    } catch (e) { listEl.innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
+  };
+  $('#hl-search').onclick = load;
+  $('#hl-q').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
+  $('#hl-filter').querySelectorAll('.chip').forEach(ch => ch.onclick = () => {
+    label = ch.dataset.v;
+    $('#hl-filter').querySelectorAll('.chip').forEach(x => x.classList.toggle('active', x === ch)); load();
+  });
+  load();
+}
+
+/* ===== 账实差异提示（系统数 vs 实物数 差距大的 SKU）===== */
+async function renderStockGap(container) {
+  container.innerHTML = navbar('账实差异提醒', true) + `
+  <div class="page-body">
+    <div class="card" style="background:var(--orange-soft);border:1px solid #fdba74">
+      <div style="font-size:13px;line-height:1.7;color:#9a3412">
+        📌 以下 SKU 的<b>系统库存与实物库存差距较大</b>（差异≥10 件 且 ≥系统数 20%）。<br>
+        已知原因：商家先上实物后上系统单据，属正常现象，此处仅作提醒便于盘点跟进，<b>不会自动调整数据</b>。
+      </div>
+    </div>
+    <div class="search-bar"><input class="inp" id="sg-q" placeholder="搜索 SKU"><button class="btn primary" id="sg-search">搜索</button></div>
+    <div id="sg-list"><div class="loading">加载中...</div></div>
+  </div>`;
+  const load = async () => {
+    const listEl = $('#sg-list');
+    listEl.innerHTML = '<div class="loading">加载中...</div>';
+    try {
+      const params = new URLSearchParams();
+      const q = trim($('#sg-q').value);
+      if (q) params.set('q', q);
+      const r = await api('/stock-gap?' + params.toString());
+      if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">✅</span>没有差距较大的 SKU</div>';
+      listEl.innerHTML = r.list.map(x => `
+      <div class="list-item">
+        <div class="li-head"><span class="li-name">${esc(x.sku)}</span>
+          <span class="badge" style="background:${x.gap > 0 ? '#fff7ed;color:#c2410c' : '#eff6ff;color:#1d4ed8'}">${x.gap > 0 ? '实物多 ' + fmtQty(x.gap) : '系统多 ' + fmtQty(-x.gap)}</span></div>
+        <div class="li-row"><span>系统库存:<b>${fmtQty(x.sys_qty)}</b></span><span>实物库存:<b>${fmtQty(x.phy_qty)}</b></span></div>
+      </div>`).join('');
+    } catch (e) { listEl.innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
+  };
+  $('#sg-search').onclick = load;
+  $('#sg-q').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
+  load();
+}
+
+/* ===== 分货映射 ===== */
+async function renderDistrMapping(container) {
+  container.innerHTML = navbar('分货基础数据', true) + `
+  <div class="page-body">
+    <div class="search-bar"><input class="inp" id="dm-q" placeholder="SKU / 通道 / 储位"><button class="btn primary" id="dm-search">搜索</button></div>
+    <div id="dm-list"><div class="loading">加载中...</div></div>
+  </div>`;
+  const load = async () => {
+    const listEl = $('#dm-list');
+    listEl.innerHTML = '<div class="loading">加载中...</div>';
+    try {
+      const q = trim($('#dm-q').value);
+      const r = await api('/picking-mappings' + (q ? `?q=${encodeURIComponent(q)}` : ''));
+      if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无映射数据</div>';
+      listEl.innerHTML = r.list.map(x => `
+      <div class="list-item">
+        <div class="li-head"><span class="li-name">${esc(x.sku)}</span><span class="badge teal">通道 ${esc(x.channel || '-')}</span></div>
+        <div class="li-row"><span>储位:<b>${esc(x.location || '-')}</b></span></div>
+      </div>`).join('');
+    } catch (e) { listEl.innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
+  };
+  $('#dm-search').onclick = load;
+  $('#dm-q').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
+  load();
+}
+
+/* ===== 账号管理 ===== */
+async function renderUsers(container) {
+  if (!isAdmin()) { container.innerHTML = navbar('账号管理', true) + '<div class="page-body"><div class="empty"><span class="emoji">🔒</span>仅管理员可访问</div></div>'; return; }
+  container.innerHTML = navbar('账号管理', true, `<button class="btn tiny primary" id="u-add">+ 新增</button>`) + `
+  <div class="page-body"><div id="u-body"><div class="loading">加载中...</div></div></div>`;
+  const load = async () => {
+    try {
+      const r = await api('/users');
+      const s = r.summary;
+      $('#u-body').innerHTML = `
+      <div class="stat-grid cols-3">
+        <div class="stat-card"><div class="label">👑 管理员</div><div class="value">${s.admin}</div></div>
+        <div class="stat-card"><div class="label">👤 员工</div><div class="value">${s.user}</div></div>
+        <div class="stat-card"><div class="label">🚚 分货员</div><div class="value">${s.picker}</div></div>
+      </div>
+      ${r.list.map(u => `
+      <div class="list-item">
+        <div class="li-head"><span class="li-name">${esc(u.username)}</span>
+          ${u.status !== 'active' ? '<span class="badge red">已停用</span>' : ''}
+          <span class="badge ${u.role === 'admin' ? 'admin' : 'gray'}">${esc(ROLE_NAME[u.role] || u.role)}</span></div>
+        <div class="li-row"><span>已授权 <b>${(u.permissions || []).length}</b> 项</span>
+          <span>盘点模式:${u.inventory_mode_restriction === 'free' ? '员工自选' : u.inventory_mode_restriction === 'force_piece' ? '强制逐件' : '强制批量'}</span>
+          <span>导入权限:${u.allow_daily_inventory_import ? '已启用' : '已禁用'}</span></div>
+        <div class="li-actions"><button class="btn tiny ghost" data-id="${u.id}">编辑 / 重置密码</button></div>
+      </div>`).join('')}
+      ${r.list.filter(u => u.status !== 'active').length ? '' : ''}`;
+      $('#u-body').querySelectorAll('[data-id]').forEach(b => b.onclick = () => userForm(r.list.find(x => x.id === b.dataset.id), load));
+    } catch (e) { $('#u-body').innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
+  };
+  $('#u-add').onclick = () => userForm(null, load);
+  load();
+}
+const ALL_PERMS = ['putaway','finished-goods','transfer-operation','finished-goods-picking','physical-inventory-check','refurbish-picking-task','renovation-putaway','renovation-inventory-query','renovation-outbound-actual','consumables','stock-io','transit','unpacking','distr-mapping','box-label','reno-label','heat-labels','users'];
+function userForm(u, onDone) {
+  const isEdit = !!u;
+  const wrap = el('div');
+  wrap.innerHTML = `
+    <div class="field"><label class="req">登录用户名</label><input class="inp" id="uf-username" value="${u ? esc(u.username) : ''}" ${isEdit ? 'readonly style="background:#f5f5f5"' : ''}></div>
+    <div class="field"><label>角色</label>
+      <select class="inp" id="uf-role">
+        <option value="user" ${u && u.role === 'user' ? 'selected' : ''}>员工（user）</option>
+        <option value="admin" ${u && u.role === 'admin' ? 'selected' : ''}>管理员（admin）</option>
+        <option value="picker" ${u && u.role === 'picker' ? 'selected' : ''}>分货员（picker）</option>
+        <option value="temp" ${u && u.role === 'temp' ? 'selected' : ''}>临时工（temp）</option>
+      </select></div>
+    ${isEdit ? `<div class="field"><label>状态</label><select class="inp" id="uf-status"><option value="active" ${u.status === 'active' ? 'selected' : ''}>启用</option><option value="disabled" ${u.status === 'disabled' ? 'selected' : ''}>停用/离职</option></select></div>` : ''}
+    <div class="field"><label>${isEdit ? '重置密码（留空不改）' : '密码'}</label><input class="inp" id="uf-pw" type="password" placeholder="至少 4 位"></div>
+    <div class="field"><label>盘点模式限制</label>
+      <select class="inp" id="uf-imr">
+        <option value="free" ${u && u.inventory_mode_restriction === 'free' ? 'selected' : ''}>员工自选</option>
+        <option value="force_piece" ${u && u.inventory_mode_restriction === 'force_piece' ? 'selected' : ''}>强制逐件</option>
+        <option value="force_batch" ${u && u.inventory_mode_restriction === 'force_batch' ? 'selected' : ''}>强制批量</option>
+      </select></div>
+    <div class="field"><label><input type="checkbox" id="uf-adi" ${u && u.allow_daily_inventory_import ? 'checked' : ''} style="width:16px;height:16px;vertical-align:-3px;margin-right:5px">日报导入权限</label></div>
+    <div class="field"><label>授权权限项</label>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">${ALL_PERMS.map(p => `<label style="display:inline-flex;align-items:center;gap:4px;background:#f5f6fa;border-radius:8px;padding:4px 8px;font-size:12px"><input type="checkbox" class="uf-perm" value="${p}" ${(u && u.permissions || []).includes(p) ? 'checked' : ''} style="width:14px;height:14px">${p}</label>`).join('')}</div></div>
+    <button class="btn primary" id="uf-save" style="margin-top:6px">保 存</button>`;
+  const mask = showSheet(isEdit ? '编辑账号' : '新增账号', wrap);
+  $('#uf-save').onclick = async () => {
+    const perms = Array.from(wrap.querySelectorAll('.uf-perm:checked')).map(c => c.value);
+    const body = {
+      username: trim($('#uf-username').value), role: $('#uf-role').value, password: $('#uf-pw').value,
+      permissions: perms, inventory_mode_restriction: $('#uf-imr').value, allow_daily_inventory_import: $('#uf-adi').checked,
+    };
+    if (isEdit) { body.status = $('#uf-status').value; delete body.username; }
+    else if (!body.username || body.password.length < 4) return toast('用户名必填，密码至少 4 位', true);
+    if (isEdit && body.password && body.password.length < 4) return toast('密码至少 4 位', true);
+    try {
+      await api('/users' + (isEdit ? `/${u.id}` : ''), { method: isEdit ? 'PUT' : 'POST', body });
+      toast(isEdit ? '已更新' : '新增成功'); mask.remove(); onDone && onDone();
+    } catch (e) { toast(e.message, true); }
+  };
+}
+
+/* ===== 在途库存 ===== */
+async function renderTransit(container) {
+  container.innerHTML = navbar('在途库存', true) + `
+  <div class="page-body">
+    <div class="filter-row" id="tr-status">
+      <button class="chip active" data-v="">全部</button><button class="chip" data-v="transit">🚚 在途</button><button class="chip" data-v="received">✅ 已到仓</button><button class="chip" data-v="cancelled">已取消</button>
+    </div>
+    <div id="tr-list"><div class="loading">加载中...</div></div>
+  </div>`;
+  let status = '';
+  const load = async () => {
+    const listEl = $('#tr-list');
+    listEl.innerHTML = '<div class="loading">加载中...</div>';
+    try {
+      const r = await api('/transit' + (status ? `?status=${status}` : ''));
+      if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无在途记录</div>';
+      const TAG = { transit: '<span class="badge orange">🚚 在途</span>', received: '<span class="badge green">✅ 已到仓</span>', cancelled: '<span class="badge gray">已取消</span>' };
+      listEl.innerHTML = r.list.map(x => `
+      <div class="list-item">
+        <div class="li-head"><span class="li-name">${esc(x.consumable_name || x.consumable_code)}</span>${TAG[x.status] || ''}</div>
+        <div class="li-row"><span>编码:${esc(x.consumable_code)}</span><span>数量:<b>${fmtQty(x.qty)}</b></span></div>
+        ${x.remark ? `<div class="li-row"><span>备注:${esc(x.remark)}</span></div>` : ''}
+        <div class="li-row"><span>${esc(x.created_at)}</span></div>
+      </div>`).join('');
+    } catch (e) { listEl.innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
+  };
+  $('#tr-status').querySelectorAll('.chip').forEach(ch => ch.onclick = () => {
+    status = ch.dataset.v;
+    $('#tr-status').querySelectorAll('.chip').forEach(x => x.classList.toggle('active', x === ch)); load();
+  });
+  load();
+}
+
+/* ===== 箱唛标签打印（成品） ===== */
+async function renderBoxLabel(container) {
+  container.innerHTML = navbar('箱唛标签打印', true) + `
+  <div class="page-body">
+    <div class="card">
+      <div class="field"><label class="req">SKU</label>
+        <div class="input-group"><span class="ig-ico">📦</span><input id="bl-sku" placeholder="输入 SKU"><button class="btn tiny primary" id="bl-query">查询</button></div></div>
+      <div id="bl-preview" style="margin-top:10px"></div>
+    </div>
+    <div style="font-size:12px;color:var(--muted-foreground);line-height:1.6;padding:0 4px">标签规格 100×150mm 满幅；拣货位自适应（一品一位打印拣货位条码，多品打印地堆/高架）。</div>
+  </div>`;
+  const query = async () => {
+    const sku = trim($('#bl-sku').value);
+    if (!sku) return toast('请输入 SKU', true);
+    try {
+      const r = await api('/box-label/fg?sku=' + encodeURIComponent(sku));
+      const pv = $('#bl-preview');
+      if (!r.item) { pv.innerHTML = '<div style="color:var(--red);font-size:13px">❌ 未找到该 SKU</div>'; return; }
+      const it = r.item;
+      const heatTxt = it.heat_label === 'hot' ? '🔥 爆品' : it.heat_label === 'cold' ? '❄️ 淡品' : '常规';
+      const locs = [];
+      if (it.ground_location && it.ground_quantity > 0) locs.push({ l: it.ground_location, t: '地堆' });
+      it.high_shelves.forEach(h => locs.push({ l: h.location, t: '高架' }));
+      if (it.pick_location && it.pick_quantity > 0) locs.push({ l: it.pick_location, t: '拣货' });
+      pv.innerHTML = `
+      <div style="border:2px solid #334155;border-radius:10px;padding:12px;background:#fff">
+        <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+          <span style="font-weight:800;font-size:18px">${esc(it.sku)}</span>
+          <span class="badge ${it.heat_label === 'hot' ? 'red' : it.heat_label === 'cold' ? 'teal' : 'gray'}">${heatTxt}</span></div>
+        ${it.category ? `<div style="font-size:13px;color:var(--muted-foreground);margin-bottom:8px">品类：${esc(it.category)}</div>` : ''}
+        ${locs.map(x => `
+        <div style="margin-top:8px">
+          <div style="font-size:11px;color:var(--muted-foreground)">${x.t}位</div>
+          <div style="font-family:monospace;font-size:22px;font-weight:800;letter-spacing:2px;background:#f8fafc;padding:6px 8px;border-radius:6px">${esc(x.l)}</div>
+          <div style="display:flex;gap:2px;margin-top:5px;height:46px;overflow:hidden">
+            ${Array.from({length: Math.min(x.l.replace(/-/g,'').length, 24)}, (_, i) => `<div style="width:${2 + ((i * 7) % 4)}px;background:#000;height:100%"></div>`).join('')}
+          </div>
+        </div>`).join('')}
+      </div>
+      <button class="btn primary" style="margin-top:12px" onclick="window.print()">🖨️ 打印标签</button>`;
+    } catch (e) { toast(e.message, true); }
+  };
+  $('#bl-query').onclick = query;
+  $('#bl-sku').addEventListener('keydown', e => { if (e.key === 'Enter') query(); });
+}
+
+/* ===== 翻新箱唛打印 ===== */
+async function renderRenoLabel(container) {
+  container.innerHTML = navbar('翻新箱唛打印', true) + `
+  <div class="page-body">
+    <div class="card">
+      <div class="field"><label class="req">搜索翻新库存（SKU / 储位）</label>
+        <div class="input-group"><span class="ig-ico">🔎</span><input id="rl-q" placeholder="SKU / 储位号"><button class="btn tiny primary" id="rl-search">搜索</button></div></div>
+      <div id="rl-list" style="margin-top:10px"></div>
+    </div>
+    <div id="rl-preview"></div>
+  </div>`;
+  let picked = null;
+  const search = async () => {
+    const q = trim($('#rl-q').value);
+    if (!q) return toast('请输入搜索条件', true);
+    try {
+      const r = await api('/reno-labels/search?q=' + encodeURIComponent(q));
+      const listEl = $('#rl-list');
+      if (!r.list.length) { listEl.innerHTML = '<div style="font-size:13px;color:var(--muted)">未找到记录</div>'; return; }
+      listEl.innerHTML = r.list.map(x => `
+        <div class="sub-item" data-id="${x.id}" style="border:1px solid var(--border);border-radius:10px;margin-bottom:6px">
+          <div class="s-text"><div class="s-name">${esc(x.sku)}</div>
+          <div class="s-desc">${esc(x.shelf_no)} · ${esc(x.status || '-')} · ${esc(x.condition || '-')} · ${fmtQty(x.quantity)}件</div></div>
+        </div>`).join('');
+      listEl.querySelectorAll('[data-id]').forEach(n => n.onclick = () => {
+        picked = r.list.find(x => x.id === n.dataset.id);
+        listEl.querySelectorAll('.sub-item').forEach(x => x.style.borderColor = 'var(--border)');
+        n.style.borderColor = 'var(--primary)';
+        const it = picked;
+        $('#rl-preview').innerHTML = `
+        <div class="card" style="border:2px solid #334155">
+          <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+            <span style="font-weight:800;font-size:18px">${esc(it.sku)}</span>
+            <span class="badge green">${esc(it.status || '翻新成功')}</span></div>
+          <div style="font-size:12px;color:var(--muted-foreground);margin-bottom:4px">渠道：${esc(it.channel || '-')} · 成色：${esc(it.condition || '-')}</div>
+          <div style="font-family:monospace;font-size:22px;font-weight:800;background:#f8fafc;padding:6px 8px;border-radius:6px">${esc(it.shelf_no)}</div>
+          <div style="display:flex;gap:2px;margin-top:5px;height:46px;overflow:hidden">
+            ${Array.from({length: Math.min(it.shelf_no.replace(/-/g,'').length, 24)}, (_, i) => `<div style="width:${2 + ((i * 7) % 4)}px;background:#000;height:100%"></div>`).join('')}
+          </div>
+          <button class="btn primary" style="margin-top:12px" onclick="window.print()">🖨️ 打印标签</button>
+        </div>`;
+      });
+    } catch (e) { toast(e.message, true); }
+  };
+  $('#rl-search').onclick = search;
+  $('#rl-q').addEventListener('keydown', e => { if (e.key === 'Enter') search(); });
+}
+
+/* ===== 可上架匹配 ===== */
+async function renderPutawayMatch(container) {
+  container.innerHTML = navbar('可上架匹配', true) + `
+  <div class="page-body">
+    <div class="search-bar"><input class="inp" id="pm-q" placeholder="搜索 SKU"><button class="btn primary" id="pm-search">搜索</button></div>
+    <div id="pm-list"><div class="loading">加载中...</div></div>
+  </div>`;
+  const load = async () => {
+    const listEl = $('#pm-list');
+    listEl.innerHTML = '<div class="loading">加载中...</div>';
+    try {
+      const q = trim($('#pm-q').value);
+      const r = await api('/putaway-match' + (q ? `?q=${encodeURIComponent(q)}` : ''));
+      if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无可上架匹配</div>';
+      listEl.innerHTML = r.list.map(f => `
+      <div class="list-item">
+        <div class="li-head"><span class="li-name">${esc(f.sku)}</span>
+          <span class="badge green">可上架 ${fmtQty(f.matchQty)} 件</span></div>
+        <div class="li-row"><span>系统库存:<b>${fmtQty(f.ss)}</b></span><span>实物总量:<b>${fmtQty(f.phy)}</b></span></div>
+        <div class="li-row"><span>地堆 ${fmtQty(f.ground_quantity)} · 高架 ${fmtQty(f.high_shelf_quantity)} · 拣货 ${fmtQty(f.pick_quantity)}</span></div>
+        <div class="li-actions"><a class="btn tiny primary" href="#/putaway">去上架</a></div>
+      </div>`).join('');
+    } catch (e) { listEl.innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
+  };
+  $('#pm-search').onclick = load;
+  $('#pm-q').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
+  load();
+}
+
+/* ===== 实物库存盘点 ===== */
+async function renderFGInventory(container) {
+  container.innerHTML = navbar('实物库存盘点', true) + `
+  <div class="page-body">
+    <div class="card">
+      <div style="font-size:13px;color:var(--muted-foreground);margin-bottom:10px">逐件/批量盘点成品实物：录入实盘数量，自动计算差异，勾选"校准"将直接修正库存</div>
+      <div class="field"><label class="req">SKU</label>
+        <div class="input-group"><span class="ig-ico">📦</span><input id="fi-sku" placeholder="输入 SKU"><button class="btn tiny primary" id="fi-query">查询</button></div></div>
+      <div id="fi-info" style="margin-bottom:12px"></div>
+      <div class="field"><label class="req">盘点储位</label><input class="inp" id="fi-loc" placeholder="储位编码"></div>
+      <div class="field"><label class="req">实盘数量</label><input class="inp" id="fi-actual" type="number" placeholder="实盘数量"></div>
+      <div class="field"><label><input type="checkbox" id="fi-apply" style="width:16px;height:16px;vertical-align:-3px;margin-right:5px">差异直接校准库存</label></div>
+      <button class="btn primary" id="fi-submit">提交盘点</button>
+    </div>
+  </div>`;
+  let fg = null;
+  const query = async () => {
+    const sku = trim($('#fi-sku').value);
+    if (!sku) return toast('请输入 SKU', true);
+    try {
+      const r = await api('/finished-goods?q=' + encodeURIComponent(sku));
+      fg = r.list.find(x => x.sku === sku) || null;
+      const info = $('#fi-info');
+      if (!fg) { info.innerHTML = '<div style="color:var(--red);font-size:13px">❌ SKU 不存在</div>'; return; }
+      const highs = r.highMap[sku] || [];
+      const locs = [];
+      if (fg.ground_quantity > 0 && fg.ground_location) locs.push(`${fg.ground_location}（地堆 ${fg.ground_quantity}）`);
+      highs.forEach(h => locs.push(`${h.location}（高架 ${h.quantity}）`));
+      if (fg.pick_quantity > 0 && fg.pick_location) locs.push(`${fg.pick_location}（拣货 ${fg.pick_quantity}）`);
+      info.innerHTML = `<div style="background:var(--primary-soft);padding:9px 11px;border-radius:10px;font-size:12px">
+        <b>${esc(fg.sku)}</b> 系统库存 ${fmtQty(Number(fg.system_stock) || 0)}<br>${locs.map(l => '📍 ' + esc(l)).join('<br>')}</div>`;
+    } catch (e) { toast(e.message, true); }
+  };
+  $('#fi-query').onclick = query;
+  $('#fi-sku').addEventListener('keydown', e => { if (e.key === 'Enter') query(); });
+  $('#fi-submit').onclick = async () => {
+    const sku = trim($('#fi-sku').value), loc = trim($('#fi-loc').value), actual = Number($('#fi-actual').value);
+    if (!sku || !loc) return toast('SKU 和储位必填', true);
+    if (Number.isNaN(actual)) return toast('请输入实盘数量', true);
+    try {
+      const r = await api('/fg-inventory', { method: 'POST', body: { sku, location: loc, actual_qty: actual, apply: $('#fi-apply').checked } });
+      toast(`✅ 盘点完成，差异 ${r.diff >= 0 ? '+' : ''}${r.diff}${$('#fi-apply').checked ? '（已校准）' : ''}`);
+      $('#fi-loc').value = ''; $('#fi-actual').value = '';
+      if (fg) query();
+    } catch (e) { toast(e.message, true); }
+  };
+}
+
+/* ===== 包材库存盘点 ===== */
+async function renderConInventory(container) {
+  container.innerHTML = navbar('包材库存盘点', true) + `
+  <div class="page-body">
+    <div class="search-bar"><input class="inp" id="ci-q" placeholder="编码 / 储位"><button class="btn primary" id="ci-search">搜索</button></div>
+    <div id="ci-list"><div class="loading">加载中...</div></div>
+  </div>`;
+  const load = async () => {
+    const listEl = $('#ci-list');
+    listEl.innerHTML = '<div class="loading">加载中...</div>';
+    try {
+      const q = trim($('#ci-q').value);
+      const r = await api('/con-inventory' + (q ? `?q=${encodeURIComponent(q)}` : ''));
+      if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>未找到耗材</div>';
+      listEl.innerHTML = r.list.map(c => `
+      <div class="list-item">
+        <div class="li-head"><span class="li-name">${esc(c.name)}</span><span style="font-size:13px;font-weight:700">系统 ${fmtQty(c.stock)}</span></div>
+        <div class="li-row"><span>储位:<b>${esc(c.shelf_code || '-')}</b></span></div>
+        <div class="li-actions">
+          <input class="inp" style="height:32px;width:100px;border-radius:8px;font-size:13px" placeholder="实盘数量" data-act="qty" data-id="${c.id}" type="number">
+          <label style="font-size:11px;display:flex;align-items:center;gap:3px"><input type="checkbox" data-act="apply" data-id="${c.id}" style="width:13px;height:13px">校准</label>
+          <button class="btn tiny primary" data-act="submit" data-id="${c.id}" data-name="${esc(c.name)}">提交</button>
+        </div>
+      </div>`).join('');
+      listEl.querySelectorAll('[data-act="submit"]').forEach(b => b.onclick = async () => {
+        const id = b.dataset.id;
+        const qty = Number(listEl.querySelector(`[data-act="qty"][data-id="${id}"]`).value);
+        const apply = listEl.querySelector(`[data-act="apply"][data-id="${id}"]`).checked;
+        if (Number.isNaN(qty)) return toast('请输入实盘数量', true);
+        try {
+          const r = await api('/con-inventory', { method: 'POST', body: { id, actual_qty: qty, apply } });
+          toast(`✅ 盘点完成，差异 ${r.diff >= 0 ? '+' : ''}${r.diff}`);
+          load();
+        } catch (e) { toast(e.message, true); }
+      });
+    } catch (e) { listEl.innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
+  };
+  $('#ci-search').onclick = load;
+  $('#ci-q').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
+  load();
+}
+
+/* ===== 翻新后出库匹配 ===== */
+async function renderRenoOutbound(container) {
+  container.innerHTML = navbar('翻新后出库匹配', true) + `
+  <div class="page-body">
+    <div class="search-bar"><input class="inp" id="ro-q" placeholder="SKU / 储位"><button class="btn primary" id="ro-search">搜索</button></div>
+    <div id="ro-list"><div class="loading">加载中...</div></div>
+  </div>`;
+  const load = async () => {
+    const listEl = $('#ro-list');
+    listEl.innerHTML = '<div class="loading">加载中...</div>';
+    try {
+      const q = trim($('#ro-q').value);
+      const r = await api('/reno-outbound' + (q ? `?q=${encodeURIComponent(q)}` : ''));
+      if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无库存</div>';
+      listEl.innerHTML = r.list.map(x => `
+      <div class="list-item">
+        <div class="li-head"><span class="li-name">${esc(x.sku)}</span>
+          <span style="display:flex;gap:5px;align-items:center">
+            ${x.status === '翻新成功' ? '<span class="badge green">翻新成功</span>' : '<span class="badge gray">' + esc(x.status || '-') + '</span>'}
+            <span style="font-weight:700">${fmtQty(x.quantity)}件</span></span></div>
+        <div class="li-row"><span>储位:<b>${esc(x.shelf_no)}</b></span><span>成色:${esc(x.condition || '-')}</span><span>渠道:${esc(x.channel || '-')}</span></div>
+        <div class="li-actions">
+          <button class="btn tiny primary" data-act="out" data-id="${x.id}" data-sku="${esc(x.sku)}" data-max="${x.quantity}">出库扣减</button>
+        </div>
+      </div>`).join('');
+      listEl.querySelectorAll('[data-act="out"]').forEach(b => b.onclick = async () => {
+        const id = b.dataset.id, sku = b.dataset.sku, max = b.dataset.max;
+        const wrap = el('div');
+        wrap.innerHTML = `
+          <div style="font-size:13px;margin-bottom:10px">SKU <b>${esc(sku)}</b>（当前库存 ${fmtQty(max)} 件）</div>
+          <div class="field"><label class="req">出库数量</label><input class="inp" id="ro-qty" type="number" min="1" max="${max}"></div>
+          <button class="btn danger" id="ro-confirm">确认出库</button>`;
+        const mask = showSheet('翻新出库', wrap);
+        $('#ro-confirm').onclick = async () => {
+          const qty = Number($('#ro-qty').value);
+          if (!qty || qty <= 0) return toast('请输入正确数量', true);
+          if (!(await confirmBox(`确认出库 ${sku} × ${qty}？`))) return;
+          try { await api('/reno-outbound', { method: 'POST', body: { id, qty } }); toast('✅ 出库成功'); mask.remove(); load(); }
+          catch (e) { toast(e.message, true); }
+        };
+      });
+    } catch (e) { listEl.innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
+  };
+  $('#ro-search').onclick = load;
+  $('#ro-q').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
+  load();
+}
+
+/* ===== 翻新后上架作业 ===== */
+async function renderRenoPutaway(container) {
+  container.innerHTML = navbar('翻新后上架作业', true) + `
+  <div class="page-body">
+    <div class="card">
+      <div style="font-size:13px;color:var(--muted-foreground);margin-bottom:10px">扫码/输入 SKU 上架到货架，登记翻新结果与成色</div>
+      <div class="field"><label class="req">SKU</label><input class="inp" id="rp-sku" placeholder="SKU"></div>
+      <div class="field"><label class="req">储位号</label><input class="inp" id="rp-shelf" placeholder="如 FX-01-05-001"></div>
+      <div class="field"><label class="req">数量</label><input class="inp" id="rp-qty" type="number" min="1"></div>
+      <div class="field"><label class="req">翻新结果</label>
+        <select class="inp" id="rp-status"><option>翻新成功</option><option>翻新失败</option></select></div>
+      <div class="field"><label class="req">成色</label>
+        <select class="inp" id="rp-condition"><option>九成新</option><option>五成新</option><option>全新</option><option>功能不良</option><option>外观不良</option><option>混合</option></select></div>
+      <div class="field"><label>阶段</label>
+        <select class="inp" id="rp-stage"><option>搬仓后</option><option>搬仓前</option></select></div>
+      <div class="field"><label>渠道</label>
+        <select class="inp" id="rp-channel"><option>自翻新</option><option>中通翻新</option><option>辰谦</option></select></div>
+      <button class="btn primary" id="rp-submit">提交上架</button>
+    </div>
+  </div>`;
+  $('#rp-submit').onclick = async () => {
+    const body = {
+      sku: trim($('#rp-sku').value), shelf_no: trim($('#rp-shelf').value), qty: Number($('#rp-qty').value),
+      status: $('#rp-status').value, condition: $('#rp-condition').value, stage: $('#rp-stage').value, channel: $('#rp-channel').value,
+    };
+    if (!body.sku || !body.shelf_no || !body.qty || body.qty <= 0) return toast('SKU、储位、数量必填', true);
+    try {
+      await api('/reno-putaway', { method: 'POST', body });
+      toast('✅ 上架成功');
+      $('#rp-sku').value = ''; $('#rp-shelf').value = ''; $('#rp-qty').value = '';
+    } catch (e) { toast(e.message, true); }
+  };
+}
+
+/* ===== 翻新后移库 ===== */
+async function renderRenoTransfer(container) {
+  container.innerHTML = navbar('翻新后移库操作', true) + `
+  <div class="page-body">
+    <div class="card">
+      <div class="field"><label class="req">搜索待移库记录</label>
+        <div class="input-group"><span class="ig-ico">🔎</span><input id="rt-q" placeholder="SKU / 储位"><button class="btn tiny primary" id="rt-search">搜索</button></div></div>
+      <div id="rt-list" style="margin-top:10px"></div>
+    </div>
+    <div id="rt-form"></div>
+  </div>`;
+  let picked = null;
+  const search = async () => {
+    const q = trim($('#rt-q').value);
+    if (!q) return toast('请输入搜索条件', true);
+    try {
+      const r = await api('/reno-putaway?q=' + encodeURIComponent(q));
+      const listEl = $('#rt-list');
+      if (!r.list.length) { listEl.innerHTML = '<div style="font-size:13px;color:var(--muted)">未找到记录</div>'; return; }
+      listEl.innerHTML = r.list.map(x => `
+        <div class="sub-item" data-id="${x.id}" style="border:1px solid var(--border);border-radius:10px;margin-bottom:6px">
+          <div class="s-text"><div class="s-name">${esc(x.sku)}</div>
+          <div class="s-desc">${esc(x.shelf_no)} · ${esc(x.condition || '-')} · ${fmtQty(x.quantity)}件</div></div>
+        </div>`).join('');
+      listEl.querySelectorAll('[data-id]').forEach(n => n.onclick = () => {
+        picked = r.list.find(x => x.id === n.dataset.id);
+        listEl.querySelectorAll('.sub-item').forEach(x => x.style.borderColor = 'var(--border)');
+        n.style.borderColor = 'var(--primary)';
+        $('#rt-form').innerHTML = `
+        <div class="card">
+          <div style="font-size:13px;margin-bottom:8px">已选：<b>${esc(picked.sku)}</b> · 当前储位 ${esc(picked.shelf_no)} · ${fmtQty(picked.quantity)}件</div>
+          <div class="field"><label class="req">目标储位</label><input class="inp" id="rt-to" placeholder="目标储位号"></div>
+          <div class="field"><label class="req">移库数量</label><input class="inp" id="rt-qty" type="number" min="1" max="${picked.quantity}"></div>
+          <button class="btn primary" id="rt-submit">确认移库</button>
+        </div>`;
+        $('#rt-submit').onclick = async () => {
+          const to = trim($('#rt-to').value), qty = Number($('#rt-qty').value);
+          if (!to || !qty || qty <= 0) return toast('请填写目标储位和数量', true);
+          try {
+            await api('/reno-transfer', { method: 'POST', body: { id: picked.id, to_shelf: to, qty } });
+            toast('✅ 移库成功'); $('#rt-form').innerHTML = ''; $('#rt-q').value = '';
+            listEl.innerHTML = ''; picked = null;
+          } catch (e) { toast(e.message, true); }
+        };
+      });
+    } catch (e) { toast(e.message, true); }
+  };
+  $('#rt-search').onclick = search;
+  $('#rt-q').addEventListener('keydown', e => { if (e.key === 'Enter') search(); });
+}
+
+/* ===== 包材采购建议 ===== */
+async function renderPurchaseAdvice(container) {
+  container.innerHTML = navbar('包材采购建议', true) + `
+  <div class="page-body" id="pa-body"><div class="loading">加载中...</div></div>`;
+  try {
+    const r = await api('/purchase-advice');
+    const body = $('#pa-body');
+    body.innerHTML = `
+    <div class="stat-grid">
+      <div class="stat-card" style="background:linear-gradient(135deg,#fef2f2,#fee2e2)"><div class="label">🚨 低库存待补</div><div class="value" style="color:var(--red)">${r.advice.length}</div></div>
+      <div class="stat-card" style="background:linear-gradient(135deg,#fefce8,#fef9c3)"><div class="label">📦 积压待清理</div><div class="value" style="color:var(--orange)">${r.dead.length}</div></div>
+    </div>
+    <div class="section-title">🚨 低库存补货建议（缺口按 MOQ 向上取整）</div>
+    ${r.advice.length ? r.advice.map(c => `
+    <div class="list-item">
+      <div class="li-head"><span class="li-name">${esc(c.name)}</span><span class="badge red">缺 ${fmtQty(c.gap)}</span></div>
+      <div class="li-row"><span>物料名:<b>${esc(c.material_name || '-')}</b></span><span>储位:${esc(c.shelf_code || '-')}</span></div>
+      <div class="li-row"><span>当前 <b class="low-dot">${fmtQty(c.stock)}</b> / 安全 ${fmtQty(c.safety_stock)}</span><span>MOQ ${fmtQty(c.moq || 1000)}</span></div>
+      <div class="li-row" style="margin-top:4px"><span style="color:var(--green);font-weight:700">建议采购 ${fmtQty(c.suggest)} ${esc(c.unit || '个')}</span></div>
+    </div>`).join('') : '<div class="empty"><span class="emoji">🎉</span>无低库存耗材</div>'}
+    ${r.dead.length ? `
+    <div class="section-title">📦 积压清理建议（超过安全库存2倍且60天未入库）</div>
+    ${r.dead.map(c => `
+    <div class="list-item">
+      <div class="li-head"><span class="li-name">${esc(c.name)}</span><span class="badge orange">积压 ${fmtQty(c.stock)}</span></div>
+      <div class="li-row"><span>物料名:<b>${esc(c.material_name || '-')}</b></span><span>储位:${esc(c.shelf_code || '-')}</span></div>
+      <div class="li-row"><span>当前 ${fmtQty(c.stock)} / 安全 ${fmtQty(c.safety_stock)}</span><span>最后入库:${esc(c.last_in_date || '无')}</span></div>
+    </div>`).join('')}` : ''}`;
+  } catch (e) { $('#pa-body').innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
+}
+
+/* ===== 使用排行 ===== */
+async function renderUsageRank(container) {
+  container.innerHTML = navbar('使用排行', true) + `<div class="page-body"><div id="ur-body"><div class="loading">加载中...</div></div></div>`;
+  try {
+    const r = await api('/usage-rank');
+    const body = $('#ur-body');
+    if (!r.list.length) { body.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无使用记录</div>'; return; }
+    body.innerHTML = `
+    <div class="section-title">📊 耗材使用频率排行（按出库量）</div>
+    ${r.list.map((x, i) => {
+      const name = x.name || '(已删除)';
+      return `
+      <div class="list-item">
+        <div class="li-head"><span style="display:flex;align-items:center;gap:8px"><span style="width:22px;height:22px;border-radius:50%;background:${i < 3 ? 'var(--orange-soft)' : '#f1f3f9'};color:${i < 3 ? 'var(--orange)' : 'var(--muted)'};font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center">${i + 1}</span><span class="li-name">${esc(name)}</span></span>
+          <span style="font-weight:700;color:var(--orange)">出库 ${fmtQty(Math.round(x.outQty))}</span></div>
+        ${x.material_name ? `<div class="li-row"><span>物料名:<b>${esc(x.material_name)}</b></span></div>` : ''}
+        <div class="li-row"><span>出库 ${fmtQty(Math.round(x.outQty))}</span><span>入库 ${fmtQty(Math.round(x.inQty))}</span><span>记录 ${x.cnt} 条</span></div>
+      </div>`;
+    }).join('')}`;
+  } catch (e) { $('#ur-body').innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
+}
+
+/* ===== 分货作业 ===== */
+async function renderDistrWork(container) {
+  container.innerHTML = navbar('分货作业', true) + `
+  <div class="page-body">
+    <div class="card">
+      <div style="font-size:13px;color:var(--muted-foreground);margin-bottom:10px">输入 SKU 查询该商品的通道号与储位号映射</div>
+      <div class="field"><label class="req">SKU</label>
+        <div class="input-group"><span class="ig-ico">📦</span><input id="dw-sku" placeholder="输入 SKU"><button class="btn tiny primary" id="dw-query">查询</button></div></div>
+      <div id="dw-result" style="margin-top:10px"></div>
+    </div>
+  </div>`;
+  const query = async () => {
+    const sku = trim($('#dw-sku').value);
+    if (!sku) return toast('请输入 SKU', true);
+    try {
+      const r = await api('/distr-work?sku=' + encodeURIComponent(sku));
+      const rs = $('#dw-result');
+      if (!r.mappings.length) { rs.innerHTML = '<div style="color:var(--muted);font-size:13px">未找到该 SKU 的分货映射</div>'; return; }
+      const s = r.stock;
+      rs.innerHTML = `
+        ${s ? `<div style="background:var(--primary-soft);padding:8px 10px;border-radius:10px;font-size:12px;margin-bottom:10px"><b>${esc(s.sku)}</b> 系统库存 ${fmtQty(Number(s.system_stock) || 0)} · 实物 ${fmtQty((Number(s.ground_quantity)||0)+(Number(s.high_shelf_quantity)||0)+(Number(s.pick_quantity)||0))}</div>` : ''}
+        ${r.mappings.map(m => `
+        <div style="border:1px solid var(--border);border-radius:12px;padding:11px 12px;margin-bottom:8px">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <span class="badge teal">通道 ${esc(m.channel || '-')}</span>
+            <span style="font-family:monospace;font-weight:700;font-size:15px">${esc(m.location || '-')}</span>
+          </div>
+        </div>`).join('')}`;
+    } catch (e) { toast(e.message, true); }
+  };
+  $('#dw-query').onclick = query;
+  $('#dw-sku').addEventListener('keydown', e => { if (e.key === 'Enter') query(); });
+}
+
+/* ===== 分货统计 ===== */
+async function renderDistrStats(container) {
+  container.innerHTML = navbar('分货统计', true) + `<div class="page-body" id="ds-body"><div class="loading">加载中...</div></div>`;
+  try {
+    const r = await api('/distr-stats');
+    $('#ds-body').innerHTML = `
+    <div class="stat-grid cols-3">
+      <div class="stat-card"><div class="label">📦 总映射数</div><div class="value">${fmtQty(r.total)}</div></div>
+      <div class="stat-card"><div class="label">🔀 通道数</div><div class="value">${r.byChannel.length}</div></div>
+      <div class="stat-card"><div class="label">📍 储区数</div><div class="value">${r.byZone.length}</div></div>
+    </div>
+    <div class="section-title">🔀 按通道汇总</div>
+    ${r.byChannel.map(c => `
+    <div class="list-item">
+      <div class="li-head"><span class="li-name">通道 ${esc(c.channel)}</span><span style="font-weight:700">${fmtQty(c.cnt)} 条</span></div>
+    </div>`).join('')}
+    <div class="section-title">📍 按储区汇总</div>
+    ${r.byZone.map(z => `
+    <div class="list-item">
+      <div class="li-head"><span class="li-name">${esc(z.zone)} 区</span><span style="font-weight:700">${fmtQty(z.cnt)} 条</span></div>
+    </div>`).join('')}`;
+  } catch (e) { $('#ds-body').innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
+}
+
+/* ===== 修改密码 ===== */
+async function renderChangePassword(container) {
+  container.innerHTML = navbar('修改登录密码', true) + `
+  <div class="page-body">
+    <div class="card">
+      <div class="field"><label class="req">原密码</label><input class="inp" id="cp-old" type="password" placeholder="原密码"></div>
+      <div class="field"><label class="req">新密码</label><input class="inp" id="cp-new" type="password" placeholder="至少 4 位"></div>
+      <div class="field"><label class="req">确认新密码</label><input class="inp" id="cp-confirm" type="password" placeholder="再次输入新密码"></div>
+      <button class="btn primary" id="cp-submit">修改密码</button>
+      <div style="font-size:11px;color:var(--muted);margin-top:10px">修改后管理者将同步可见最新密码</div>
+    </div>
+  </div>`;
+  $('#cp-submit').onclick = async () => {
+    const oldPw = $('#cp-old').value, newPw = $('#cp-new').value, confirm = $('#cp-confirm').value;
+    if (!oldPw || !newPw) return toast('请填写完整', true);
+    if (newPw !== confirm) return toast('两次输入的新密码不一致', true);
+    if (newPw.length < 4) return toast('新密码至少 4 位', true);
+    try {
+      await api('/change-password', { method: 'POST', body: { old_password: oldPw, new_password: newPw } });
+      toast('✅ 密码修改成功'); history.back();
+    } catch (e) { toast(e.message, true); }
+  };
+}
+
+/* ===== 首页排序 ===== */
+async function renderHomeSort(container) {
+  const u = getUser();
+  const KEY = 'xiaoan_home_order_v1';
+  const DEFAULT = [
+    { name: '实物库存查询', href: '#/fg-stock', ico: '🔎' },
+    { name: '上架作业', href: '#/putaway', ico: '📥' },
+    { name: '箱唛标签打印', href: '#/box-label', ico: '🖨️' },
+    { name: '耗材列表', href: '#/consumables', ico: '📦' },
+    { name: '入库登记', href: '#/stock-io?type=in', ico: '⬇️' },
+    { name: '出库登记', href: '#/stock-io?type=out', ico: '⬆️' },
+    { name: '记录查询', href: '#/records', ico: '📋' },
+    { name: '拆包统计', href: '#/unpack-stats', ico: '✂️' },
+  ];
+  let order = DEFAULT;
+  try { order = JSON.parse(localStorage.getItem(KEY)) || DEFAULT; } catch {}
+  const render = () => {
+    container.innerHTML = navbar('常用功能排序', true, `<button class="btn tiny ghost" id="hs-reset">重置</button>`) + `
+    <div class="page-body">
+      <div style="font-size:12px;color:var(--muted-foreground);margin-bottom:10px">点击上下箭头调整常用功能宫格顺序（仅当前设备生效）</div>
+      ${order.map((it, i) => `
+      <div class="list-item" style="display:flex;align-items:center;gap:10px">
+        <span style="font-size:20px;width:30px;text-align:center">${it.ico}</span>
+        <span style="flex:1;font-weight:600">${esc(it.name)}</span>
+        <button class="btn tiny ghost" data-act="up" data-i="${i}" ${i === 0 ? 'disabled' : ''}>↑</button>
+        <button class="btn tiny ghost" data-act="down" data-i="${i}" ${i === order.length - 1 ? 'disabled' : ''}>↓</button>
+      </div>`).join('')}
+      <button class="btn primary" style="margin-top:14px" id="hs-save">保存排序</button>
+    </div>`;
+    container.querySelectorAll('[data-act]').forEach(b => b.onclick = () => {
+      const i = Number(b.dataset.i);
+      if (b.dataset.act === 'up' && i > 0) { [order[i - 1], order[i]] = [order[i], order[i - 1]]; }
+      if (b.dataset.act === 'down' && i < order.length - 1) { [order[i + 1], order[i]] = [order[i], order[i + 1]]; }
+      render();
+    });
+    $('#hs-save').onclick = () => { localStorage.setItem(KEY, JSON.stringify(order)); toast('✅ 已保存，返回首页生效'); location.hash = '#/'; };
+    $('#hs-reset').onclick = () => { order = [...DEFAULT]; render(); };
+  };
+  render();
+}
+
+/* ===== SKU 映射管理 ===== */
+async function renderSkuMappings(container) {
+  container.innerHTML = navbar('SKU 映射管理', true, isAdmin() ? `<button class="btn tiny primary" id="sm-add">+ 新增</button>` : '') + `
+  <div class="page-body">
+    <div class="card" style="font-size:12px;color:var(--muted-foreground);line-height:1.6;margin-bottom:12px">SKU ↔ 包材映射：数据源 = 新 BOM 绑定档案（sku_consumable_bindings）+ 备选包材档案（alternative_material_bindings），主 BOM 优先。此处为 SKU→包材映射明细。</div>
+    <div class="search-bar"><input class="inp" id="sm-q" placeholder="SKU / 包材编码 / 物料名"><button class="btn primary" id="sm-search">搜索</button></div>
+    <div id="sm-list"><div class="loading">加载中...</div></div>
+  </div>`;
+  const load = async () => {
+    const listEl = $('#sm-list');
+    listEl.innerHTML = '<div class="loading">加载中...</div>';
+    try {
+      const q = trim($('#sm-q').value);
+      const r = await api('/sku-mappings' + (q ? `?q=${encodeURIComponent(q)}` : ''));
+      if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无映射</div>';
+      listEl.innerHTML = r.list.map(x => `
+      <div class="list-item">
+        <div class="li-head"><span class="li-name">SKU ${esc(x.sku)}</span>${x.consumable_name ? `<span class="badge blue">${esc(x.consumable_name)}</span>` : '<span class="badge gray">耗材已删</span>'}</div>
+        ${x.material_name ? `<div class="li-row"><span>物料名:<b>${esc(x.material_name)}</b></span></div>` : ''}
+        ${x.note ? `<div class="li-row"><span>备注:${esc(x.note)}</span></div>` : ''}
+        ${isAdmin() ? `<div class="li-actions"><button class="btn tiny ghost" data-act="del" data-id="${x.id}" style="color:var(--red)">删除</button></div>` : ''}
+      </div>`).join('');
+      if (isAdmin()) {
+        listEl.querySelectorAll('[data-act="del"]').forEach(b => b.onclick = async () => {
+          if (!(await confirmBox('确定删除该映射？', true))) return;
+          try { await api('/sku-mappings/' + b.dataset.id, { method: 'DELETE' }); toast('已删除'); load(); }
+          catch (e) { toast(e.message, true); }
+        });
+        if ($('#sm-add')) $('#sm-add').onclick = async () => {
+          // 拉耗材列表供选择
+          const wrap = el('div');
+          wrap.innerHTML = `
+            <div class="field"><label class="req">SKU</label><input class="inp" id="smf-sku" placeholder="SKU"></div>
+            <div class="field"><label class="req">包材编码</label>
+              <div class="input-group"><input id="smf-code" placeholder="搜索包材编码"><button class="btn tiny primary" id="smf-pick">搜索</button></div>
+              <div id="smf-picked" style="margin-top:8px"></div></div>
+            <div class="field"><label>备注</label><input class="inp" id="smf-note"></div>
+            <button class="btn primary" id="smf-save">保 存</button>`;
+          const mask = showSheet('新增 SKU 映射', wrap);
+          let cid = null;
+          $('#smf-pick').onclick = async () => {
+            const q2 = trim($('#smf-code').value);
+            if (!q2) return toast('请输入包材编码', true);
+            const rc = await api('/consumables?q=' + encodeURIComponent(q2));
+            const area = $('#smf-picked');
+            if (!rc.list.length) { area.innerHTML = '<div style="font-size:12px;color:var(--muted)">未找到</div>'; return; }
+            area.innerHTML = rc.list.slice(0, 5).map(c => `<div class="sub-item" data-id="${c.id}" style="border:1px solid var(--border);border-radius:10px;margin-bottom:6px"><div class="s-text"><div class="s-name">${esc(c.name)}</div><div class="s-desc">${esc(c.material_name || '')}</div></div></div>`).join('');
+            area.querySelectorAll('[data-id]').forEach(n => n.onclick = () => {
+              cid = n.dataset.id;
+              area.innerHTML = `<div style="background:var(--green-soft);padding:8px 10px;border-radius:10px;font-size:13px">✅ 已选</div>`;
+            });
+          };
+          $('#smf-save').onclick = async () => {
+            const sku = trim($('#smf-sku').value);
+            if (!sku || !cid) return toast('请填写 SKU 并选择包材', true);
+            try { await api('/sku-mappings', { method: 'POST', body: { sku, consumable_id: cid, note: trim($('#smf-note').value) } }); toast('已新增'); mask.remove(); load(); }
+            catch (e) { toast(e.message, true); }
+          };
+        };
+      }
+    } catch (e) { listEl.innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
+  };
+  $('#sm-search').onclick = load;
+  $('#sm-q').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
+  load();
+}
+
+/* ===== 路由 ===== */
+function parseHash() {
+  const h = location.hash.replace(/^#/, '') || '/';
+  const [pathname, qs] = h.split('?');
+  const query = {};
+  if (qs) new URLSearchParams(qs).forEach((v, k) => { query[k] = v; });
+  return { pathname, query };
+}
+async function route() {
+  const app = $('#app');
+  const { pathname, query } = parseHash();
+  const user = getUser();
+  if (!user && pathname !== '/login') { location.hash = '#/login'; return; }
+  if (user && pathname === '/login') { location.hash = '#/'; return; }
+  const container = el('div', 'page');
+  app.innerHTML = '';
+  app.appendChild(container);
+  try {
+    switch (pathname) {
+      case '/login': renderLogin(); return;
+      case '/': await renderHome(container); break;
+      case '/records': await renderRecords(container); break;
+      case '/me': renderMe(container); break;
+      case '/consumables': await renderConsumables(container); break;
+      case '/stock-io': await renderStockIO(container, query); break;
+      case '/fg-stock': await renderFGStock(container); break;
+      case '/stock-gap': await renderStockGap(container); break;
+      case '/putaway': await renderPutaway(container); break;
+      case '/fg-picking': await renderFGPicking(container); break;
+      case '/transfer': await renderTransfer(container); break;
+      case '/renovation-stats': await renderRenoStats(container); break;
+      case '/reno-inventory': await renderRenoInventory(container); break;
+      case '/unpack-stats': await renderUnpackStats(container); break;
+      case '/heat-labels': await renderHeatLabels(container); break;
+      case '/distr-mapping': await renderDistrMapping(container); break;
+      case '/users': await renderUsers(container); break;
+      case '/transit': await renderTransit(container); break;
+      case '/sku-mappings': await renderSkuMappings(container); break;
+      case '/box-label': await renderBoxLabel(container); break;
+      case '/reno-label': await renderRenoLabel(container); break;
+      case '/putaway-match': await renderPutawayMatch(container); break;
+      case '/fg-inventory': await renderFGInventory(container); break;
+      case '/con-inventory': await renderConInventory(container); break;
+      case '/reno-outbound': await renderRenoOutbound(container); break;
+      case '/reno-putaway': await renderRenoPutaway(container); break;
+      case '/reno-transfer': await renderRenoTransfer(container); break;
+      case '/purchase-advice': await renderPurchaseAdvice(container); break;
+      case '/usage-rank': await renderUsageRank(container); break;
+      case '/distr-work': await renderDistrWork(container); break;
+      case '/distr-stats': await renderDistrStats(container); break;
+      case '/change-password': await renderChangePassword(container); break;
+      case '/home-sort': await renderHomeSort(container); break;
+      default:
+        container.innerHTML = navbar('提示', true) + '<div class="page-body"><div class="empty"><span class="emoji">🚧</span>页面开发中</div></div>';
+    }
+  } catch (e) {
+    container.innerHTML = navbar('出错了', true) + `<div class="page-body"><div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div></div>`;
+  }
+}
+window.addEventListener('hashchange', route);
+route();
+
+</script>
 
 </body>
 </html>
