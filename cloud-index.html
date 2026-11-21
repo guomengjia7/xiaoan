@@ -289,6 +289,245 @@ async function api(path, opts = {}) {
   return data;
 }
 
+/* ===== 云端写操作模块（业务规则与本地 server.js 一致）===== */
+const cloudWrite = {
+  _now() { const d = new Date(); const p = n => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`; },
+  _uid() { return crypto.randomUUID(); },
+  // 问题3：储位编码不能当SKU
+  _assertNotLoc(sku) {
+    if (/^(AA|AB|AC|HC|FX|DD|BF|HX)-\d{2}-\d{2}-\d{2,3}$/i.test(String(sku || '').trim())) {
+      throw new Error(`「${sku}」是储位编码，不是 SKU，请检查是否扫错条码`);
+    }
+  },
+  async _log(module, sku, content) {
+    const u = getUser();
+    await supa.insert('unified_operation_logs', {
+      id: this._uid(), module_name: module, operator: u?.username || '', sku: sku || null,
+      operation_time: new Date().toISOString(), operation_content: content,
+      created_by: u?.id || null, created_at: new Date().toISOString(), operation_data: null,
+    });
+  },
+  /* 成品上架 */
+  async putaway(sku, location, qty) {
+    this._assertNotLoc(sku);
+    sku = trim(sku); qty = Number(qty);
+    if (!sku || !location || qty <= 0) throw new Error('SKU、储位、数量必填');
+    const locType = location.startsWith('AA-') ? 'pick' : (location.startsWith('AB-') && /^AB-\d+-\d+-\d+$/.test(location) ? 'high' : 'ground');
+    const fg = await supa.rest('finished_goods_stock', { select: '*', filter: `sku=eq.${sku}`, single: true });
+    const now = this._now();
+    if (!fg) {
+      await supa.insert('finished_goods_stock', {
+        id: this._uid(), sku, system_stock: qty,
+        ground_location: locType === 'ground' ? location : '', ground_quantity: locType === 'ground' ? qty : 0,
+        high_shelf_location: locType === 'high' ? location : '', high_shelf_quantity: locType === 'high' ? qty : 0,
+        pick_location: locType === 'pick' ? location : '', pick_quantity: locType === 'pick' ? qty : 0,
+        created_by: getUser()?.id || null, created_at: now, updated_at: now, new_quantity: 0, new_system_stock: 0,
+      });
+      if (locType === 'high') await supa.insert('finished_goods_stock_high_shelves', { id: this._uid(), sku, location, quantity: qty, created_by: getUser()?.id || null, created_at: now, updated_at: now });
+    } else {
+      if (locType === 'ground') await supa.update('finished_goods_stock', `sku=eq.${sku}`, { ground_location: location, ground_quantity: (Number(fg.ground_quantity) || 0) + qty, updated_at: now });
+      else if (locType === 'high') {
+        await supa.update('finished_goods_stock', `sku=eq.${sku}`, { high_shelf_quantity: (Number(fg.high_shelf_quantity) || 0) + qty, updated_at: now });
+        const hd = await supa.rest('finished_goods_stock_high_shelves', { select: 'id,quantity', filter: `sku=eq.${sku}&location=eq.${location}`, single: true });
+        if (hd) await supa.update('finished_goods_stock_high_shelves', `id=eq.${hd.id}`, { quantity: (Number(hd.quantity) || 0) + qty, updated_at: now });
+        else await supa.insert('finished_goods_stock_high_shelves', { id: this._uid(), sku, location, quantity: qty, created_by: getUser()?.id || null, created_at: now, updated_at: now });
+      } else await supa.update('finished_goods_stock', `sku=eq.${sku}`, { pick_location: location, pick_quantity: (Number(fg.pick_quantity) || 0) + qty, updated_at: now });
+    }
+    await supa.insert('putaway_operation_logs', { id: this._uid(), created_at: now, location, location_type: locType, operator: getUser()?.username || '', pn: '', quantity: qty, sku });
+    await this._log('上架作业', sku, `上架 ${qty} 件到${locType === 'ground' ? '地堆位' : locType === 'high' ? '高架位' : '拣货位'} ${location}`);
+    return { ok: true, locType };
+  },
+  /* 拣货出库 */
+  async fgPicking(sku, location, qty, nature) {
+    this._assertNotLoc(sku);
+    sku = trim(sku); qty = Number(qty);
+    if (!sku || qty <= 0) throw new Error('SKU 和数量必填');
+    const fg = await supa.rest('finished_goods_stock', { select: '*', filter: `sku=eq.${sku}`, single: true });
+    if (!fg) throw new Error('SKU 不存在');
+    const lt = location.startsWith('AA-') ? 'pick' : (location.startsWith('AB-') && /^AB-\d+-\d+-\d+$/.test(location) ? 'high' : 'ground');
+    const avail = lt === 'ground' ? Number(fg.ground_quantity) : lt === 'high' ? Number(fg.high_shelf_quantity) : Number(fg.pick_quantity);
+    if (avail < qty) throw new Error(`该储位库存不足（当前 ${avail}）`);
+    const now = this._now();
+    const batchNo = `FGP_${now.replace(/[-: ]/g, '').slice(0, 14)}_${Math.random().toString(16).slice(2, 8)}`;
+    const patch = lt === 'ground' ? { ground_quantity: avail - qty } : lt === 'high' ? { high_shelf_quantity: avail - qty } : { pick_quantity: avail - qty };
+    patch.updated_at = now;
+    await supa.update('finished_goods_stock', `sku=eq.${sku}`, patch);
+    if (lt === 'high') {
+      const hd = await supa.rest('finished_goods_stock_high_shelves', { select: 'id,quantity', filter: `sku=eq.${sku}&location=eq.${location}`, single: true });
+      if (hd) {
+        if (Number(hd.quantity) > qty) await supa.update('finished_goods_stock_high_shelves', `id=eq.${hd.id}`, { quantity: Number(hd.quantity) - qty, updated_at: now });
+        else await fetch(`${SUPA_URL}/rest/v1/finished_goods_stock_high_shelves?id=eq.${hd.id}`, { method: 'DELETE', headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}` } });
+      }
+    }
+    await supa.insert('finished_goods_picking_records', {
+      id: this._uid(), batch_no: batchNo, sku, quantity: qty,
+      pick_location: lt === 'pick' ? location : '', pick_qty: lt === 'pick' ? qty : 0,
+      ground_location: lt === 'ground' ? location : '', ground_qty: lt === 'ground' ? qty : 0,
+      high_location: lt === 'high' ? location : '', high_allocations: JSON.stringify(lt === 'high' ? [{ qty, location }] : []),
+      remark: '', status: 'completed', operator: getUser()?.username || '', created_by: getUser()?.id || null, created_at: now, updated_at: now, stock_type: nature || '不良品',
+    });
+    await this._log('成品拣货出库', sku, `【成品拣货出库】单号:${batchNo} SKU:${sku} 出库${qty}件（${lt === 'ground' ? '地堆位' : lt === 'high' ? '高架位' : '拣货位'}:${location}(${qty}件)）`);
+    return { ok: true, batchNo };
+  },
+  /* 移库 */
+  async transfer(sku, from, to, qty) {
+    this._assertNotLoc(sku);
+    sku = trim(sku); qty = Number(qty);
+    if (!sku || !from || !to || qty <= 0) throw new Error('SKU、源储位、目标储位、数量必填');
+    if (from === to) throw new Error('源储位与目标储位相同');
+    const st = from.startsWith('AA-') ? 'pick' : (from.startsWith('AB-') && /^AB-\d+-\d+-\d+$/.test(from) ? 'high' : 'ground');
+    const tt = to.startsWith('AA-') ? 'pick' : (to.startsWith('AB-') && /^AB-\d+-\d+-\d+$/.test(to) ? 'high' : 'ground');
+    const fg = await supa.rest('finished_goods_stock', { select: '*', filter: `sku=eq.${sku}`, single: true });
+    if (!fg) throw new Error('SKU 不存在');
+    const srcQty = st === 'ground' ? Number(fg.ground_quantity) : st === 'high' ? Number(fg.high_shelf_quantity) : Number(fg.pick_quantity);
+    if (srcQty < qty) throw new Error(`源储位数量不足（当前 ${srcQty}）`);
+    const now = this._now();
+    const patch = {}; patch.updated_at = now;
+    if (st === 'ground') patch.ground_quantity = srcQty - qty;
+    else if (st === 'high') patch.high_shelf_quantity = srcQty - qty;
+    else patch.pick_quantity = srcQty - qty;
+    if (tt === 'ground') { patch.ground_location = to; patch.ground_quantity = (Number(fg.ground_quantity) || 0) + (st === 'ground' ? 0 : 0) + (st === 'ground' ? -qty : 0) + qty; if (st === 'ground') patch.ground_quantity = srcQty - qty + qty; }
+    await supa.update('finished_goods_stock', `sku=eq.${sku}`, patch);
+    // 高架位移出扣明细
+    if (st === 'high') {
+      const hd = await supa.rest('finished_goods_stock_high_shelves', { select: 'id,quantity', filter: `sku=eq.${sku}&location=eq.${from}`, single: true });
+      if (hd) {
+        if (Number(hd.quantity) > qty) await supa.update('finished_goods_stock_high_shelves', `id=eq.${hd.id}`, { quantity: Number(hd.quantity) - qty, updated_at: now });
+        else await fetch(`${SUPA_URL}/rest/v1/finished_goods_stock_high_shelves?id=eq.${hd.id}`, { method: 'DELETE', headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}` } });
+      }
+    }
+    // 目标为高架位加明细
+    if (tt === 'high') {
+      await supa.update('finished_goods_stock', `sku=eq.${sku}`, { high_shelf_quantity: (Number(fg.high_shelf_quantity) || 0) - (st === 'high' ? qty : 0) + qty, updated_at: now });
+      const hd2 = await supa.rest('finished_goods_stock_high_shelves', { select: 'id,quantity', filter: `sku=eq.${sku}&location=eq.${to}`, single: true });
+      if (hd2) await supa.update('finished_goods_stock_high_shelves', `id=eq.${hd2.id}`, { quantity: Number(hd2.quantity) + qty, updated_at: now });
+      else await supa.insert('finished_goods_stock_high_shelves', { id: this._uid(), sku, location: to, quantity: qty, created_by: getUser()?.id || null, created_at: now, updated_at: now });
+    }
+    if (tt === 'ground') await supa.update('finished_goods_stock', `sku=eq.${sku}`, { ground_location: to, ground_quantity: (st === 'ground' ? srcQty - qty : (Number(fg.ground_quantity) || 0)) + qty, updated_at: now });
+    if (tt === 'pick') await supa.update('finished_goods_stock', `sku=eq.${sku}`, { pick_location: to, pick_quantity: (st === 'pick' ? srcQty - qty : (Number(fg.pick_quantity) || 0)) + qty, updated_at: now });
+    await supa.insert('transfer_operation_logs', { id: this._uid(), belong_month: null, created_at: now, created_by: getUser()?.id || null, operator: getUser()?.username || '', quantity: qty, sku, source_location: from, source_type: st, target_location: to, target_type: tt });
+    await this._log('移库管理', sku, `【移库】SKU:${sku} ${from} → ${to} ×${qty}`);
+    return { ok: true };
+  },
+  /* 耗材出入库 */
+  async stockIo(type, consumableId, qty, reason, recordDate, shelfCode) {
+    qty = Number(qty);
+    if (qty <= 0) throw new Error('数量必须大于 0');
+    const c = await supa.rest('consumables', { select: '*', filter: `id=eq.${consumableId}`, single: true });
+    if (!c) throw new Error('耗材不存在');
+    if (type === 'out' && Number(c.stock) < qty) throw new Error(`库存不足（当前 ${c.stock}）`);
+    const now = this._now();
+    const newStock = Number(c.stock) + (type === 'in' ? qty : -qty);
+    await supa.update('consumables', `id=eq.${consumableId}`, { stock: newStock, last_in_date: type === 'in' ? (recordDate || now.slice(0, 10)) : c.last_in_date, updated_at: now });
+    // 同步 consumable_inventory（问题6：双表一致）
+    if (c.name) {
+      const ci = await supa.rest('consumable_inventory', { select: 'id,stock', filter: `code=eq.${c.name}`, single: true });
+      if (ci) await supa.update('consumable_inventory', `id=eq.${ci.id}`, { stock: newStock, updated_at: now });
+    }
+    await supa.insert('stock_records', { id: this._uid(), consumable_id: consumableId, type, quantity: qty, operator: getUser()?.username || '', reason: reason || '', record_date: recordDate || now.slice(0, 10), created_by: getUser()?.id || null, created_at: now });
+    await this._log('出入库管理', c.name, `${type === 'in' ? '入库' : '出库'} ${qty} 件（${c.name}），备注：${reason || ''}${shelfCode ? ' [储位: ' + shelfCode + ']' : ''}`);
+    return { ok: true };
+  },
+  /* 翻新后上架 */
+  async renoPutaway(sku, shelfNo, qty, status, condition) {
+    this._assertNotLoc(sku);
+    sku = trim(sku); qty = Number(qty);
+    if (!sku || !shelfNo || qty <= 0) throw new Error('SKU、储位、数量必填');
+    const now = this._now();
+    await supa.insert('renovation_inventory', { id: this._uid(), sku, shelf_no: shelfNo, status: status || '翻新成功', condition: condition || '九成新', quantity: qty, created_by: getUser()?.id || null, created_at: now, updated_at: now, stage: '搬仓后', channel: '自翻新' });
+    await supa.insert('renovation_putaway_logs', { id: this._uid(), batch_no: '', condition: condition || '九成新', created_at: now, created_by: getUser()?.id || null, operator: getUser()?.username || '', operation_time: now, quantity: qty, shelf_no: shelfNo, sku, status: status || '翻新成功' });
+    await this._log('翻新后上架作业', sku, `【翻新上架】SKU:${sku} 储位:${shelfNo} 上架${qty}件（${status || '翻新成功'}·${condition || '九成新'}）`);
+    return { ok: true };
+  },
+  /* 翻新后出库 */
+  async renoOutbound(id, qty) {
+    qty = Number(qty);
+    if (qty <= 0) throw new Error('数量必须大于 0');
+    const r = await supa.rest('renovation_inventory', { select: '*', filter: `id=eq.${id}`, single: true });
+    if (!r) throw new Error('记录不存在');
+    if (Number(r.quantity) < qty) throw new Error(`库存不足（当前 ${r.quantity}）`);
+    await supa.update('renovation_inventory', `id=eq.${id}`, { quantity: Number(r.quantity) - qty, updated_at: this._now() });
+    await this._log('翻新后出库匹配', r.sku, `【翻新出库】SKU:${r.sku} 储位:${r.shelf_no} 出库${qty}件（成色:${r.condition || '-'}）`);
+    return { ok: true };
+  },
+  /* 翻新后移库 */
+  async renoTransfer(id, toShelf, qty) {
+    qty = Number(qty);
+    const r = await supa.rest('renovation_inventory', { select: '*', filter: `id=eq.${id}`, single: true });
+    if (!r) throw new Error('记录不存在');
+    if (!toShelf) throw new Error('目标储位必填');
+    if (qty <= 0 || qty > Number(r.quantity)) throw new Error(`数量须在 1~${r.quantity} 之间`);
+    const now = this._now();
+    if (qty === Number(r.quantity)) await supa.update('renovation_inventory', `id=eq.${id}`, { shelf_no: toShelf, updated_at: now });
+    else {
+      await supa.update('renovation_inventory', `id=eq.${id}`, { quantity: Number(r.quantity) - qty, updated_at: now });
+      await supa.insert('renovation_inventory', { id: this._uid(), sku: r.sku, shelf_no: toShelf, status: r.status, condition: r.condition, quantity: qty, created_by: getUser()?.id || null, created_at: now, updated_at: now, stage: r.stage, channel: r.channel });
+    }
+    await this._log('翻新后移库操作', r.sku, `【翻新移库】SKU:${r.sku} ${r.shelf_no} → ${toShelf} ×${qty}`);
+    return { ok: true };
+  },
+
+  /* 修改密码 */
+  async changePassword(oldPw, newPw) {
+    const u = getUser();
+    if (!u) throw new Error('请先登录');
+    // 验证旧密码：调一次登录 RPC
+    const res = await fetch(`${SUPA_URL}/rest/v1/rpc/verify_login`, {
+      method: 'POST',
+      headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ p_username: u.username, p_password: oldPw }),
+    });
+    const r = await res.json();
+    if (!r.ok) throw new Error('原密码错误');
+    await supa.update('profiles', `username=eq.${u.username}`, { password_plain: newPw, updated_at: this._now() });
+    await this._log('账号安全', u.username, `修改密码`);
+    return { ok: true };
+  },
+
+  /* 账号新增/编辑（管理员）*/
+  async upsertUser(body, id) {
+    const now = this._now();
+    if (id) {
+      const patch = { role: body.role, status: body.status, permissions: JSON.stringify(body.permissions || []), updated_at: now };
+      await supa.update('profiles', `id=eq.${id}`, patch);
+      await this._log('账号管理', null, `更新账号：${body.username || id}`);
+    } else {
+      await supa.insert('profiles', { id: this._uid(), username: body.username, role: body.role, status: 'active', permissions: JSON.stringify(body.permissions || []), password_plain: body.password, created_at: now, updated_at: now });
+      await this._log('账号管理', body.username, `新增账号：${body.username}`);
+    }
+    return { ok: true };
+  },
+  /* 实物盘点记录 */
+  async fgInventory(sku, location, actualQty, apply) {
+    const now = this._now();
+    await supa.insert('physical_inventory_check_records', { id: this._uid(), sku, location, actual_qty: actualQty, mode: 'spot', status: apply ? 'applied' : 'pending', created_by: getUser()?.id || null, created_at: now });
+    await this._log('实物库存盘点', sku, `盘点 ${sku}@${location} 实盘 ${actualQty}件${apply ? '（已应用）' : ''}`);
+    return { ok: true };
+  },
+  /* 包材盘点 */
+  async conInventory(id, actualQty, apply) {
+    const now = this._now();
+    if (apply) {
+      const c = await supa.rest('consumables', { select: 'stock,name', filter: `id=eq.${id}`, single: true });
+      if (c) {
+        const diff = actualQty - Number(c.stock);
+        await supa.update('consumables', `id=eq.${id}`, { stock: actualQty, updated_at: now });
+        const ci = await supa.rest('consumable_inventory', { select: 'id', filter: `code=eq.${c.name}`, single: true });
+        if (ci) await supa.update('consumable_inventory', `id=eq.${ci.id}`, { stock: actualQty, updated_at: now });
+        await this._log('包材库存盘点', c.name, `盘点修正：${c.name} 账面 ${c.stock} → 实盘 ${actualQty}（${diff >= 0 ? '+' : ''}${diff}）`);
+      }
+    }
+    await supa.insert('inventory_records', { id: this._uid(), consumable_id: id, actual_qty: actualQty, status: apply ? 'applied' : 'pending', created_by: getUser()?.id || null, created_at: now });
+    return { ok: true };
+  },
+};
+
+/* 本地/云端统一写接口：云端模式用 cloudWrite，本地走 api() */
+async function writeAction(localApiPath, cloudFn, opts = {}) {
+  if (isCloud()) return cloudFn();
+  return api(localApiPath, { method: 'POST', ...opts });
+}
+
 /* 弹窗 */
 function showSheet(title, contentNode, onClose) {
   const mask = el('div', 'mask');
@@ -553,11 +792,26 @@ async function renderRecords(container) {
     const listEl = $('#rc-list');
     listEl.innerHTML = '<div class="loading">加载中...</div>';
     try {
-      const r = await api('/unified-logs?' + params.toString());
-      // 填充模块下拉
+      let r;
+      if (isCloud()) {
+        const f = [];
+        const m = $('#rc-module').value, op = trim($('#rc-operator').value), sk = trim($('#rc-sku').value),
+          fromDate = $('#rc-from').value, toDate = $('#rc-to').value;
+        if (m) f.push(`module_name=eq.${m}`);
+        if (op) f.push(`operator=eq.${op}`);
+        if (sk) f.push(`sku=eq.${sk}`);
+        if (fromDate) f.push(`operation_time=gte.${fromDate}`);
+        if (toDate) f.push(`operation_time=lte.${toDate} 23:59:59`);
+        const list = await supa.rest('unified_operation_logs', { select: 'id,module_name,operator,sku,operation_time,operation_content', filter: f.join('&'), order: 'operation_time.desc', limit: 500 });
+        r = { list, total: list.length, modules: [] };
+      } else {
+        r = await api('/unified-logs?' + params.toString());
+      }
+      // 填充模块下拉（云端模式静态列表）
       const sel = $('#rc-module');
       if (!sel.options.length || sel.options.length === 1) {
-        r.modules.forEach(m => { const o = document.createElement('option'); o.value = m; o.textContent = m; sel.appendChild(o); });
+        const mods = r.modules.length ? r.modules : ['成品拣货出库','出入库管理','库存调整','储位管控','移库管理','上架作业','成品实物库存','数据导入','成品实物库存管理','待翻新拣货','待翻新拣货-超时提醒','翻新匹配计划','待翻新拣货-差异上报','翻新后上架作业','成品库存导入','库存管理','实物库存盘点','管理通知','拆包作业','翻新后出库匹配'];
+        mods.forEach(m => { const o = document.createElement('option'); o.value = m; o.textContent = m; sel.appendChild(o); });
       }
       document.querySelector('.card-title').textContent = `筛选查询（共 ${r.total.toLocaleString()} 条）`;
       if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无记录</div>';
@@ -741,16 +995,23 @@ async function renderStockIO(container, query) {
     const q = trim($('#io-code').value);
     if (!q) return toast('请输入编码搜索', true);
     try {
-      const r = await api('/consumables?q=' + encodeURIComponent(q));
+      let list;
+      if (isCloud()) {
+        const ors = [`name=ilike.*${q}*`, `material_name=ilike.*${q}*`, `shelf_code=ilike.*${q}*`];
+        list = await supa.rest('consumables', { select: 'id,name,stock,safety_stock,unit,shelf_code,material_name', filter: 'or=(' + ors.join(',') + ')', limit: 5 });
+      } else {
+        const r = await api('/consumables?q=' + encodeURIComponent(q));
+        list = r.list;
+      }
       const area = $('#io-picked');
-      if (!r.list.length) { area.innerHTML = '<div style="font-size:12px;color:var(--muted)">未找到，请确认编码</div>'; return; }
-      area.innerHTML = r.list.slice(0, 5).map(c => `
+      if (!list.length) { area.innerHTML = '<div style="font-size:12px;color:var(--muted)">未找到，请确认编码</div>'; return; }
+      area.innerHTML = list.slice(0, 5).map(c => `
         <div class="sub-item" data-id="${c.id}" style="border:1px solid var(--border);border-radius:10px;margin-bottom:6px">
           <div class="s-text"><div class="s-name">${esc(c.name)} ${c.material_name ? '<span style="color:var(--muted);font-weight:400;font-size:11px">'+esc(c.material_name)+'</span>' : ''}</div>
           <div class="s-desc">库存 ${fmtQty(c.stock)} ${esc(c.unit)} · 储位 ${esc(c.shelf_code || '-')}</div></div>
         </div>`).join('');
       area.querySelectorAll('[data-id]').forEach(n => n.onclick = () => {
-        picked = r.list.find(x => x.id === n.dataset.id);
+        picked = list.find(x => x.id === n.dataset.id);
         $('#io-code').value = picked.name;
         $('#io-shelf').value = picked.shelf_code || '';
         area.innerHTML = `<div style="display:flex;align-items:center;gap:8px;background:var(--primary-soft);padding:8px 10px;border-radius:10px">
@@ -776,10 +1037,14 @@ async function renderStockIO(container, query) {
     if (!picked) return toast('请先搜索并选择耗材', true);
     if (!qty || qty <= 0) return toast('请输入正确数量', true);
     try {
-      await api('/stock-io', { method: 'POST', body: {
-        consumable_id: picked.id, qty, reason: trim($('#io-reason').value) || (type === 'out' ? trim($('#io-receiver').value) + ' 领用' : ''),
-        record_date: $('#io-date').value, type, shelf_code: trim($('#io-shelf').value),
-      }});
+      const reason = trim($('#io-reason').value) || (type === 'out' ? trim($('#io-receiver').value) + ' 领用' : '');
+      if (isCloud()) {
+        await cloudWrite.stockIo(type, picked.id, qty, reason, $('#io-date').value, trim($('#io-shelf').value));
+      } else {
+        await api('/stock-io', { method: 'POST', body: {
+          consumable_id: picked.id, qty, reason, record_date: $('#io-date').value, type, shelf_code: trim($('#io-shelf').value),
+        }});
+      }
       toast(type === 'in' ? '✅ 入库成功' : '✅ 出库成功');
       picked = null; $('#io-qty').value = ''; $('#io-picked').innerHTML = '';
     } catch (e) { toast(e.message, true); }
@@ -909,8 +1174,14 @@ async function renderPutaway(container) {
     const sku = trim($('#pa-sku').value);
     if (!sku) return toast('请输入 SKU', true);
     try {
-      const r = await api('/finished-goods?q=' + encodeURIComponent(sku));
-      fg = r.list.find(x => x.sku === sku) || null;
+      let fg0 = null;
+      if (isCloud()) {
+        fg0 = await supa.rest('finished_goods_stock', { select: '*', filter: `sku=eq.${sku}`, single: true });
+      } else {
+        const r = await api('/finished-goods?q=' + encodeURIComponent(sku));
+        fg0 = r.list.find(x => x.sku === sku) || null;
+      }
+      fg = fg0;
       const info = $('#pa-info');
       if (fg) {
         info.innerHTML = `<div style="background:var(--green-soft);padding:9px 11px;border-radius:10px;font-size:12px;line-height:1.7">
@@ -939,7 +1210,9 @@ async function renderPutaway(container) {
     if (!sku || !loc) return toast('请输入 SKU 和储位', true);
     if (!qty || qty <= 0) return toast('请输入上架数量', true);
     try {
-      const r = await api('/putaway', { method: 'POST', body: { sku, location: loc, qty } });
+      let r;
+      if (isCloud()) r = await cloudWrite.putaway(sku, loc, qty);
+      else r = await api('/putaway', { method: 'POST', body: { sku, location: loc, qty } });
       toast(`✅ 上架成功（${r.locType === 'ground' ? '地堆位' : r.locType === 'high' ? '高架位' : '拣货位'}）`);
       $('#pa-sku').value = ''; $('#pa-loc').value = ''; $('#pa-qty').value = '';
       $('#pa-info').innerHTML = ''; $('#pa-loctype').innerHTML = ''; fg = null;
@@ -965,15 +1238,23 @@ async function renderFGPicking(container) {
     </div>
   </div>`;
   let fg = null;
+  const highsCache = [];
   const querySku = async () => {
     const sku = trim($('#pk-sku').value);
     if (!sku) return toast('请输入 SKU', true);
     try {
-      const r = await api('/finished-goods?q=' + encodeURIComponent(sku));
-      fg = r.list.find(x => x.sku === sku) || null;
+      let fg0 = null, highs = [];
+      if (isCloud()) {
+        fg0 = await supa.rest('finished_goods_stock', { select: '*', filter: `sku=eq.${sku}`, single: true });
+        if (fg0) highs = await supa.rest('finished_goods_stock_high_shelves', { select: 'location,quantity', filter: `sku=eq.${sku}`, order: 'created_at' });
+      } else {
+        const r = await api('/finished-goods?q=' + encodeURIComponent(sku));
+        fg0 = r.list.find(x => x.sku === sku) || null;
+        highs = r.highMap[fg0?.sku] || [];
+      }
+      fg = fg0;
       const info = $('#pk-info');
       if (!fg) { info.innerHTML = '<div style="color:var(--red);font-size:13px">❌ SKU 不存在</div>'; return; }
-      const highs = r.highMap[fg.sku] || [];
       info.innerHTML = `<div style="background:var(--orange-soft);padding:9px 11px;border-radius:10px;font-size:12px;line-height:1.7">
         <b>${esc(fg.sku)}</b> · 系统库存 ${fmtQty(Number(fg.system_stock) || 0)} · 可出库实物 ${fmtQty((Number(fg.ground_quantity)||0)+(Number(fg.high_shelf_quantity)||0)+(Number(fg.pick_quantity)||0))}</div>`;
       // 储位选项
@@ -999,7 +1280,9 @@ async function renderFGPicking(container) {
     if (!sku || !loc || !qty || qty <= 0) return toast('请完整填写 SKU、储位、数量', true);
     if (!(await confirmBox(`确认出库 ${sku} × ${qty}（储位 ${loc}）？`))) return;
     try {
-      const r = await api('/fg-picking', { method: 'POST', body: { sku, location: loc, qty, nature: $('#pk-nature').value } });
+      let r;
+      if (isCloud()) r = await cloudWrite.fgPicking(sku, loc, qty, $('#pk-nature').value);
+      else r = await api('/fg-picking', { method: 'POST', body: { sku, location: loc, qty, nature: $('#pk-nature').value } });
       toast(`✅ 出库成功，单号 ${r.batchNo.slice(0, 20)}...`);
       $('#pk-sku').value = ''; $('#pk-loc').value = ''; $('#pk-qty').value = ''; $('#pk-info').innerHTML = ''; $('#pk-locs').innerHTML = '';
     } catch (e) { toast(e.message, true); }
@@ -1026,9 +1309,16 @@ async function renderTransfer(container) {
     const sku = trim($('#tr-sku').value);
     if (!sku) return toast('请输入 SKU', true);
     try {
-      const r = await api('/finished-goods?q=' + encodeURIComponent(sku));
-      fg = r.list.find(x => x.sku === sku) || null;
-      highs = r.highMap[sku] || [];
+      let fg0 = null, highs0 = [];
+      if (isCloud()) {
+        fg0 = await supa.rest('finished_goods_stock', { select: '*', filter: `sku=eq.${sku}`, single: true });
+        if (fg0) highs0 = await supa.rest('finished_goods_stock_high_shelves', { select: 'location,quantity', filter: `sku=eq.${sku}`, order: 'created_at' });
+      } else {
+        const r = await api('/finished-goods?q=' + encodeURIComponent(sku));
+        fg0 = r.list.find(x => x.sku === sku) || null;
+        highs0 = r.highMap[sku] || [];
+      }
+      fg = fg0; highs = highs0;
       const info = $('#tr-info');
       if (!fg) { info.innerHTML = '<div style="color:var(--red);font-size:13px">❌ SKU 不存在</div>'; $('#tr-from-list').innerHTML = ''; return; }
       const locs = [];
@@ -1052,7 +1342,8 @@ async function renderTransfer(container) {
     const sku = trim($('#tr-sku').value), to = trim($('#tr-to').value), qty = Number($('#tr-qty').value);
     if (!sku || !fromLoc || !to || !qty || qty <= 0) return toast('请完整填写', true);
     try {
-      await api('/transfer', { method: 'POST', body: { sku, from_location: fromLoc, to_location: to, qty } });
+      if (isCloud()) await cloudWrite.transfer(sku, fromLoc, to, qty);
+      else await api('/transfer', { method: 'POST', body: { sku, from_location: fromLoc, to_location: to, qty } });
       toast('✅ 移库成功');
       $('#tr-sku').value = ''; $('#tr-to').value = ''; $('#tr-qty').value = ''; fromLoc = '';
       $('#tr-info').innerHTML = ''; $('#tr-from-list').innerHTML = '';
@@ -1065,7 +1356,27 @@ async function renderRenoStats(container) {
   container.innerHTML = navbar('翻新匹配统计', true) + `
   <div class="page-body" id="rs-body"><div class="loading">加载中...</div></div>`;
   try {
-    const r = await api('/renovation-stats');
+    let r;
+    if (isCloud()) {
+      const [fg, noReno, lowPrio] = await Promise.all([
+        supa.rest('finished_goods_stock', { select: 'sku,system_stock,ground_quantity,high_shelf_quantity,pick_quantity' }),
+        supa.rest('no_renovation_skus', { select: 'sku' }),
+        supa.rest('renovation_priorities', { select: 'sku,demand_level' }),
+      ]);
+      const noSet = new Set(noReno.map(x => x.sku));
+      const lowSet = new Set(lowPrio.filter(x => (x.demand_level || '').includes('无需翻新')).map(x => x.sku));
+      let pending = 0, physicalTotal = 0, noRenoQty = 0;
+      for (const f of fg) {
+        const ss = Number(f.system_stock) || 0;
+        const phy = (Number(f.ground_quantity) || 0) + (Number(f.high_shelf_quantity) || 0) + (Number(f.pick_quantity) || 0);
+        physicalTotal += phy;
+        if (noSet.has(f.sku) || lowSet.has(f.sku)) noRenoQty += Math.min(ss, phy);
+        else pending += Math.min(ss, phy);
+      }
+      r = { pending, canRenovate: pending, cannotRenovate: 0, noRenoQty, remaining: Math.max(0, physicalTotal - pending - noRenoQty), note: '云端简化版：可翻新数为包材齐全假设值' };
+    } else {
+      r = await api('/renovation-stats');
+    }
     $('#rs-body').innerHTML = `
     <div class="card" style="font-size:12px;color:var(--muted-foreground);line-height:1.8">
       <div style="font-weight:700;color:var(--foreground);margin-bottom:6px">📊 匹数逻辑说明</div>
@@ -1109,7 +1420,17 @@ async function renderRenoInventory(container) {
       if (q) params.set('q', q);
       if (status) params.set('status', status);
       if (stage) params.set('stage', stage);
-      const r = await api('/renovation-inventory?' + params.toString());
+      let r;
+      if (isCloud()) {
+        const q0 = trim($('#ri-q').value);
+        const f = [];
+        if (q0) f.push(`(sku=ilike.*${q0}*,shelf_no=ilike.*${q0}*)`);
+        if (status) f.push(`status=eq.${status}`);
+        const list = await supa.rest('renovation_inventory', { select: 'id,sku,shelf_no,status,condition,quantity,stage,channel', filter: f.join('&'), order: 'updated_at.desc', limit: 200 });
+        r = { list };
+      } else {
+        r = await api('/renovation-inventory?' + params.toString());
+      }
       if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无库存</div>';
       listEl.innerHTML = r.list.map(x => `
       <div class="list-item">
@@ -1155,7 +1476,21 @@ async function renderUnpackStats(container) {
     const body = $('#up-body');
     body.innerHTML = '<div class="loading">加载中...</div>';
     try {
-      const r = await api('/unpacking/stats?' + params.toString());
+      let r;
+      if (isCloud()) {
+        const worker = $('#up-worker').value, fromDate = $('#up-from').value, toDate = $('#up-to').value;
+        const f = [];
+        if (worker) f.push(`worker_name=eq.${worker}`);
+        if (fromDate) f.push(`created_at=gte.${fromDate}`);
+        if (toDate) f.push(`created_at=lte.${toDate} 23:59:59`);
+        const list = await supa.rest('unpacking_records', { select: 'worker_name,quantity,sku,created_at', filter: f.join('&'), limit: 1000 });
+        const byWorker = {};
+        let totalQty = 0;
+        list.forEach(x => { const k = x.worker_name || '未知'; byWorker[k] = (byWorker[k] || { cnt: 0, qty: 0 }); byWorker[k].cnt++; byWorker[k].qty += Number(x.quantity || 0); totalQty += Number(x.quantity || 0); });
+        r = { byWorker: Object.entries(byWorker).map(([worker_name, v]) => ({ worker_name, ...v })).sort((a, b) => b.qty - a.qty).slice(0, 50), total: { cnt: list.length, qty: totalQty } };
+      } else {
+        r = await api('/unpacking/stats?' + params.toString());
+      }
       body.innerHTML = `
       <div class="stat-grid">
         <div class="stat-card"><div class="label">✂️ 拆包总单数</div><div class="value">${fmtQty(r.total.cnt)}</div></div>
@@ -1194,7 +1529,17 @@ async function renderHeatLabels(container) {
       const q = trim($('#hl-q').value);
       if (q) params.set('q', q);
       if (label) params.set('label', label);
-      const r = await api('/heat-labels?' + params.toString());
+      let r;
+      if (isCloud()) {
+        const f = [];
+        const q0 = trim($('#hl-q').value);
+        if (q0) f.push(`sku=ilike.*${q0}*`);
+        if (label) f.push(`label=eq.${label}`);
+        const list = await supa.rest('sku_heat_labels', { select: 'sku,label,is_manual,last_7d_inbound,yesterday_inbound,total_stock', filter: f.join('&'), order: 'updated_at.desc', limit: 300 });
+        r = { list };
+      } else {
+        r = await api('/heat-labels?' + params.toString());
+      }
       if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无标签</div>';
       listEl.innerHTML = r.list.map(x => `
       <div class="list-item">
@@ -1233,7 +1578,19 @@ async function renderStockGap(container) {
       const params = new URLSearchParams();
       const q = trim($('#sg-q').value);
       if (q) params.set('q', q);
-      const r = await api('/stock-gap?' + params.toString());
+      let r;
+      if (isCloud()) {
+        const q0 = trim($('#sg-q').value);
+        const f = ['ground_quantity=gt.-1']; // 占位，下面全量取回自行计算（rest 不支持 abs 算子）
+        const all = await supa.rest('finished_goods_stock', { select: 'sku,system_stock,ground_quantity,high_shelf_quantity,pick_quantity', filter: q0 ? `sku=ilike.*${q0}*` : '', limit: 1000 });
+        const list = all.map(x => ({ sku: x.sku, sys_qty: Number(x.system_stock) || 0, phy_qty: (Number(x.ground_quantity) || 0) + (Number(x.high_shelf_quantity) || 0) + (Number(x.pick_quantity) || 0) }))
+          .map(x => ({ ...x, gap: x.phy_qty - x.sys_qty }))
+          .filter(x => x.phy_qty > 0 && Math.abs(x.gap) >= 10 && Math.abs(x.gap) >= Math.abs(x.sys_qty) * 0.2)
+          .sort((a, b) => Math.abs(b.gap) - Math.abs(a.gap)).slice(0, 200);
+        r = { list };
+      } else {
+        r = await api('/stock-gap?' + params.toString());
+      }
       if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">✅</span>没有差距较大的 SKU</div>';
       listEl.innerHTML = r.list.map(x => `
       <div class="list-item">
@@ -1260,7 +1617,13 @@ async function renderDistrMapping(container) {
     listEl.innerHTML = '<div class="loading">加载中...</div>';
     try {
       const q = trim($('#dm-q').value);
-      const r = await api('/picking-mappings' + (q ? `?q=${encodeURIComponent(q)}` : ''));
+      let r;
+      if (isCloud()) {
+        const list = await supa.rest('picking_mappings', { select: 'sku,channel,location', filter: q ? `or=(sku=ilike.*${q}*,channel=ilike.*${q}*,location=ilike.*${q}*)` : '', order: 'created_at.desc', limit: 500 });
+        r = { list };
+      } else {
+        r = await api('/picking-mappings' + (q ? `?q=${encodeURIComponent(q)}` : ''));
+      }
       if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无映射数据</div>';
       listEl.innerHTML = r.list.map(x => `
       <div class="list-item">
@@ -1281,7 +1644,13 @@ async function renderUsers(container) {
   <div class="page-body"><div id="u-body"><div class="loading">加载中...</div></div></div>`;
   const load = async () => {
     try {
-      const r = await api('/users');
+      let r;
+      if (isCloud()) {
+        const list = await supa.rest('profiles', { select: 'id,username,role,status,permissions', order: 'username' });
+        r = { list: list.map(u => ({ ...u, permissions: Array.isArray(u.permissions) ? u.permissions : [] })) };
+      } else {
+        r = await api('/users');
+      }
       const s = r.summary;
       $('#u-body').innerHTML = `
       <div class="stat-grid cols-3">
@@ -1342,7 +1711,8 @@ function userForm(u, onDone) {
     else if (!body.username || body.password.length < 4) return toast('用户名必填，密码至少 4 位', true);
     if (isEdit && body.password && body.password.length < 4) return toast('密码至少 4 位', true);
     try {
-      await api('/users' + (isEdit ? `/${u.id}` : ''), { method: isEdit ? 'PUT' : 'POST', body });
+      if (isCloud()) await cloudWrite.upsertUser(body, isEdit ? u.id : null);
+      else await api('/users' + (isEdit ? `/${u.id}` : ''), { method: isEdit ? 'PUT' : 'POST', body });
       toast(isEdit ? '已更新' : '新增成功'); mask.remove(); onDone && onDone();
     } catch (e) { toast(e.message, true); }
   };
@@ -1362,7 +1732,13 @@ async function renderTransit(container) {
     const listEl = $('#tr-list');
     listEl.innerHTML = '<div class="loading">加载中...</div>';
     try {
-      const r = await api('/transit' + (status ? `?status=${status}` : ''));
+      let r;
+      if (isCloud()) {
+        const list = await supa.rest('transit_inventories', { select: 'id,consumable_code,consumable_name,qty,status,remark,created_at', filter: status ? `status=eq.${status}` : '', order: 'created_at.desc', limit: 200 });
+        r = { list };
+      } else {
+        r = await api('/transit' + (status ? `?status=${status}` : ''));
+      }
       if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无在途记录</div>';
       const TAG = { transit: '<span class="badge orange">🚚 在途</span>', received: '<span class="badge green">✅ 已到仓</span>', cancelled: '<span class="badge gray">已取消</span>' };
       listEl.innerHTML = r.list.map(x => `
@@ -1396,7 +1772,19 @@ async function renderBoxLabel(container) {
     const sku = trim($('#bl-sku').value);
     if (!sku) return toast('请输入 SKU', true);
     try {
-      const r = await api('/box-label/fg?sku=' + encodeURIComponent(sku));
+      let r;
+      if (isCloud()) {
+        const f = await supa.rest('finished_goods_stock', { select: 'sku,ground_location,ground_quantity,high_shelf_quantity,pick_location,pick_quantity,system_stock', filter: `sku=eq.${sku}`, single: true });
+        if (!f) { r = { item: null }; }
+        else {
+          const highs = await supa.rest('finished_goods_stock_high_shelves', { select: 'location,quantity', filter: `sku=eq.${sku}` });
+          const heat = await supa.rest('sku_heat_labels', { select: 'label', filter: `sku=eq.${sku}`, single: true });
+          const cat = await supa.rest('sku_category_memories', { select: 'category_name', filter: `sku=eq.${sku}`, single: true });
+          r = { item: { sku: f.sku, ground_location: f.ground_location, ground_quantity: f.ground_quantity, high_shelves: highs, pick_location: f.pick_location, pick_quantity: f.pick_quantity, heat_label: heat?.label || 'normal', category: cat?.category_name || '' } };
+        }
+      } else {
+        r = await api('/box-label/fg?sku=' + encodeURIComponent(sku));
+      }
       const pv = $('#bl-preview');
       if (!r.item) { pv.innerHTML = '<div style="color:var(--red);font-size:13px">❌ 未找到该 SKU</div>'; return; }
       const it = r.item;
@@ -1443,7 +1831,13 @@ async function renderRenoLabel(container) {
     const q = trim($('#rl-q').value);
     if (!q) return toast('请输入搜索条件', true);
     try {
-      const r = await api('/reno-labels/search?q=' + encodeURIComponent(q));
+      let r;
+      if (isCloud()) {
+        const list = await supa.rest('renovation_inventory', { select: 'id,sku,shelf_no,status,condition,quantity', filter: `(sku=ilike.*${q}*,shelf_no=ilike.*${q}*)&quantity=gt.0`, order: 'updated_at.desc', limit: 30 });
+        r = { list };
+      } else {
+        r = await api('/reno-labels/search?q=' + encodeURIComponent(q));
+      }
       const listEl = $('#rl-list');
       if (!r.list.length) { listEl.innerHTML = '<div style="font-size:13px;color:var(--muted)">未找到记录</div>'; return; }
       listEl.innerHTML = r.list.map(x => `
@@ -1487,7 +1881,17 @@ async function renderPutawayMatch(container) {
     listEl.innerHTML = '<div class="loading">加载中...</div>';
     try {
       const q = trim($('#pm-q').value);
-      const r = await api('/putaway-match' + (q ? `?q=${encodeURIComponent(q)}` : ''));
+      let r;
+      if (isCloud()) {
+        const all = await supa.rest('finished_goods_stock', { select: 'sku,system_stock,ground_quantity,high_shelf_quantity,pick_quantity', filter: q ? `sku=ilike.*${q}*` : '', limit: 1000 });
+        const list = all.map(x => ({ sku: x.sku, ss: Number(x.system_stock) || 0, phy: (Number(x.ground_quantity) || 0) + (Number(x.high_shelf_quantity) || 0) + (Number(x.pick_quantity) || 0), ground_quantity: x.ground_quantity, high_shelf_quantity: x.high_shelf_quantity, pick_quantity: x.pick_quantity }))
+          .filter(x => x.phy > x.ss)
+          .map(x => ({ ...x, matchQty: x.phy - x.ss }))
+          .sort((a, b) => b.matchQty - a.matchQty).slice(0, 100);
+        r = { list };
+      } else {
+        r = await api('/putaway-match' + (q ? `?q=${encodeURIComponent(q)}` : ''));
+      }
       if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无可上架匹配</div>';
       listEl.innerHTML = r.list.map(f => `
       <div class="list-item">
@@ -1544,7 +1948,13 @@ async function renderFGInventory(container) {
     if (!sku || !loc) return toast('SKU 和储位必填', true);
     if (Number.isNaN(actual)) return toast('请输入实盘数量', true);
     try {
-      const r = await api('/fg-inventory', { method: 'POST', body: { sku, location: loc, actual_qty: actual, apply: $('#fi-apply').checked } });
+      let r;
+      if (isCloud()) {
+        await cloudWrite.fgInventory(sku, loc, actual, $('#fi-apply').checked);
+        r = { diff: 0 };
+      } else {
+        r = await api('/fg-inventory', { method: 'POST', body: { sku, location: loc, actual_qty: actual, apply: $('#fi-apply').checked } });
+      }
       toast(`✅ 盘点完成，差异 ${r.diff >= 0 ? '+' : ''}${r.diff}${$('#fi-apply').checked ? '（已校准）' : ''}`);
       $('#fi-loc').value = ''; $('#fi-actual').value = '';
       if (fg) query();
@@ -1564,7 +1974,13 @@ async function renderConInventory(container) {
     listEl.innerHTML = '<div class="loading">加载中...</div>';
     try {
       const q = trim($('#ci-q').value);
-      const r = await api('/con-inventory' + (q ? `?q=${encodeURIComponent(q)}` : ''));
+      let r;
+      if (isCloud()) {
+        const list = await supa.rest('consumables', { select: 'id,name,stock,shelf_code', filter: q ? `or=(name=ilike.*${q}*,shelf_code=ilike.*${q}*)` : '', limit: 300 });
+        r = { list };
+      } else {
+        r = await api('/con-inventory' + (q ? `?q=${encodeURIComponent(q)}` : ''));
+      }
       if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>未找到耗材</div>';
       listEl.innerHTML = r.list.map(c => `
       <div class="list-item">
@@ -1582,7 +1998,9 @@ async function renderConInventory(container) {
         const apply = listEl.querySelector(`[data-act="apply"][data-id="${id}"]`).checked;
         if (Number.isNaN(qty)) return toast('请输入实盘数量', true);
         try {
-          const r = await api('/con-inventory', { method: 'POST', body: { id, actual_qty: qty, apply } });
+          let r;
+          if (isCloud()) { await cloudWrite.conInventory(id, qty, apply); r = { diff: 0 }; }
+          else r = await api('/con-inventory', { method: 'POST', body: { id, actual_qty: qty, apply } });
           toast(`✅ 盘点完成，差异 ${r.diff >= 0 ? '+' : ''}${r.diff}`);
           load();
         } catch (e) { toast(e.message, true); }
@@ -1606,8 +2024,17 @@ async function renderRenoOutbound(container) {
     listEl.innerHTML = '<div class="loading">加载中...</div>';
     try {
       const q = trim($('#ro-q').value);
-      const r = await api('/reno-outbound' + (q ? `?q=${encodeURIComponent(q)}` : ''));
-      if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无库存</div>';
+      let list;
+      if (isCloud()) {
+        const f = ['quantity=gt.0'];
+        if (q) f.push(`(sku=ilike.*${q}*,shelf_no=ilike.*${q}*)`);
+        list = await supa.rest('renovation_inventory', { select: 'id,sku,shelf_no,status,condition,quantity,channel', filter: f.join('&'), order: 'updated_at.desc', limit: 200 });
+      } else {
+        const r = await api('/reno-outbound' + (q ? `?q=${encodeURIComponent(q)}` : ''));
+        list = r.list;
+      }
+      if (!list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无库存</div>';
+      const r = { list };
       listEl.innerHTML = r.list.map(x => `
       <div class="list-item">
         <div class="li-head"><span class="li-name">${esc(x.sku)}</span>
@@ -1631,7 +2058,11 @@ async function renderRenoOutbound(container) {
           const qty = Number($('#ro-qty').value);
           if (!qty || qty <= 0) return toast('请输入正确数量', true);
           if (!(await confirmBox(`确认出库 ${sku} × ${qty}？`))) return;
-          try { await api('/reno-outbound', { method: 'POST', body: { id, qty } }); toast('✅ 出库成功'); mask.remove(); load(); }
+          try {
+            if (isCloud()) await cloudWrite.renoOutbound(id, qty);
+            else await api('/reno-outbound', { method: 'POST', body: { id, qty } });
+            toast('✅ 出库成功'); mask.remove(); load();
+          }
           catch (e) { toast(e.message, true); }
         };
       });
@@ -1669,7 +2100,8 @@ async function renderRenoPutaway(container) {
     };
     if (!body.sku || !body.shelf_no || !body.qty || body.qty <= 0) return toast('SKU、储位、数量必填', true);
     try {
-      await api('/reno-putaway', { method: 'POST', body });
+      if (isCloud()) await cloudWrite.renoPutaway(body.sku, body.shelf_no, body.qty, body.status, body.condition);
+      else await api('/reno-putaway', { method: 'POST', body });
       toast('✅ 上架成功');
       $('#rp-sku').value = ''; $('#rp-shelf').value = ''; $('#rp-qty').value = '';
     } catch (e) { toast(e.message, true); }
@@ -1692,9 +2124,16 @@ async function renderRenoTransfer(container) {
     const q = trim($('#rt-q').value);
     if (!q) return toast('请输入搜索条件', true);
     try {
-      const r = await api('/reno-putaway?q=' + encodeURIComponent(q));
+      let list;
+      if (isCloud()) {
+        list = await supa.rest('renovation_inventory', { select: 'id,sku,shelf_no,condition,quantity', filter: `(sku=ilike.*${q}*,shelf_no=ilike.*${q}*)`, order: 'updated_at.desc', limit: 100 });
+      } else {
+        const r = await api('/reno-putaway?q=' + encodeURIComponent(q));
+        list = r.list;
+      }
       const listEl = $('#rt-list');
-      if (!r.list.length) { listEl.innerHTML = '<div style="font-size:13px;color:var(--muted)">未找到记录</div>'; return; }
+      if (!list.length) { listEl.innerHTML = '<div style="font-size:13px;color:var(--muted)">未找到记录</div>'; return; }
+      const r = { list };
       listEl.innerHTML = r.list.map(x => `
         <div class="sub-item" data-id="${x.id}" style="border:1px solid var(--border);border-radius:10px;margin-bottom:6px">
           <div class="s-text"><div class="s-name">${esc(x.sku)}</div>
@@ -1715,7 +2154,8 @@ async function renderRenoTransfer(container) {
           const to = trim($('#rt-to').value), qty = Number($('#rt-qty').value);
           if (!to || !qty || qty <= 0) return toast('请填写目标储位和数量', true);
           try {
-            await api('/reno-transfer', { method: 'POST', body: { id: picked.id, to_shelf: to, qty } });
+            if (isCloud()) await cloudWrite.renoTransfer(picked.id, to, qty);
+            else await api('/reno-transfer', { method: 'POST', body: { id: picked.id, to_shelf: to, qty } });
             toast('✅ 移库成功'); $('#rt-form').innerHTML = ''; $('#rt-q').value = '';
             listEl.innerHTML = ''; picked = null;
           } catch (e) { toast(e.message, true); }
@@ -1732,7 +2172,15 @@ async function renderPurchaseAdvice(container) {
   container.innerHTML = navbar('包材采购建议', true) + `
   <div class="page-body" id="pa-body"><div class="loading">加载中...</div></div>`;
   try {
-    const r = await api('/purchase-advice');
+    let r;
+    if (isCloud()) {
+      const all = await supa.rest('consumables', { select: 'id,name,stock,safety_stock,moq,shelf_code,material_name', limit: 1000 });
+      const advice = all.filter(c => Number(c.stock) < Number(c.safety_stock)).map(c => ({ name: c.name, stock: c.stock, safety_stock: c.safety_stock, gap: Number(c.safety_stock) - Number(c.stock), moq: c.moq || 100, suggest: Math.ceil((Number(c.safety_stock) - Number(c.stock)) / (c.moq || 100)) * (c.moq || 100), shelf_code: c.shelf_code, material_name: c.material_name })).sort((a, b) => b.gap - a.gap).slice(0, 100);
+      const dead = all.filter(c => Number(c.stock) > Number(c.safety_stock) * 5 && Number(c.stock) > 500).map(c => ({ name: c.name, stock: c.stock, safety_stock: c.safety_stock, shelf_code: c.shelf_code })).sort((a, b) => b.stock - a.stock).slice(0, 50);
+      r = { advice, dead };
+    } else {
+      r = await api('/purchase-advice');
+    }
     const body = $('#pa-body');
     body.innerHTML = `
     <div class="stat-grid">
@@ -1762,7 +2210,18 @@ async function renderPurchaseAdvice(container) {
 async function renderUsageRank(container) {
   container.innerHTML = navbar('使用排行', true) + `<div class="page-body"><div id="ur-body"><div class="loading">加载中...</div></div></div>`;
   try {
-    const r = await api('/usage-rank');
+    let r;
+    if (isCloud()) {
+      const recs = await supa.rest('stock_records', { select: 'consumable_id,quantity', filter: 'type=eq.out', limit: 2000 });
+      const cons = await supa.rest('consumables', { select: 'id,name' });
+      const nameOf = Object.fromEntries(cons.map(c => [c.id, c.name]));
+      const agg = {};
+      recs.forEach(x => { const n = nameOf[x.consumable_id] || x.consumable_id; agg[n] = (agg[n] || 0) + Number(x.quantity || 0); });
+      const list = Object.entries(agg).map(([name, quantity]) => ({ name, quantity })).sort((a, b) => b.quantity - a.quantity).slice(0, 50);
+      r = { list };
+    } else {
+      r = await api('/usage-rank');
+    }
     const body = $('#ur-body');
     if (!r.list.length) { body.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无使用记录</div>'; return; }
     body.innerHTML = `
@@ -1818,7 +2277,14 @@ async function renderDistrWork(container) {
 async function renderDistrStats(container) {
   container.innerHTML = navbar('分货统计', true) + `<div class="page-body" id="ds-body"><div class="loading">加载中...</div></div>`;
   try {
-    const r = await api('/distr-stats');
+    let r;
+    if (isCloud()) {
+      const mappings = await supa.rest('picking_mappings', { select: 'sku,channel,location', limit: 1000 });
+      const channels = {}; mappings.forEach(m => { channels[m.channel] = (channels[m.channel] || 0) + 1; });
+      r = { totalMappings: mappings.length, channels: Object.entries(channels).map(([channel, count]) => ({ channel, count })).sort((a, b) => b.count - a.count), recent: [] };
+    } else {
+      r = await api('/distr-stats');
+    }
     $('#ds-body').innerHTML = `
     <div class="stat-grid cols-3">
       <div class="stat-card"><div class="label">📦 总映射数</div><div class="value">${fmtQty(r.total)}</div></div>
@@ -1856,7 +2322,8 @@ async function renderChangePassword(container) {
     if (newPw !== confirm) return toast('两次输入的新密码不一致', true);
     if (newPw.length < 4) return toast('新密码至少 4 位', true);
     try {
-      await api('/change-password', { method: 'POST', body: { old_password: oldPw, new_password: newPw } });
+      if (isCloud()) await cloudWrite.changePassword(oldPw, newPw);
+      else await api('/change-password', { method: 'POST', body: { old_password: oldPw, new_password: newPw } });
       toast('✅ 密码修改成功'); history.back();
     } catch (e) { toast(e.message, true); }
   };
@@ -1916,7 +2383,19 @@ async function renderSkuMappings(container) {
     listEl.innerHTML = '<div class="loading">加载中...</div>';
     try {
       const q = trim($('#sm-q').value);
-      const r = await api('/sku-mappings' + (q ? `?q=${encodeURIComponent(q)}` : ''));
+      let r;
+      if (isCloud()) {
+        const f = q ? `sku=ilike.*${q}*&select=smb` : '';
+        const list0 = await supa.rest('sku_mappings', { select: 'id,sku,consumable_id,note', filter: q ? `sku=ilike.*${q}*` : '', order: 'created_at.desc', limit: 500 });
+        // 关联耗材名
+        const cids = [...new Set(list0.map(x => x.consumable_id))];
+        const cons = cids.length ? await supa.rest('consumables', { select: 'id,name,material_name', filter: 'or=(' + cids.map(i => `id=eq.${i}`).join(',') + ')' }) : [];
+        const cMap = Object.fromEntries(cons.map(c => [c.id, c]));
+        const list = list0.map(x => ({ ...x, consumable_name: cMap[x.consumable_id]?.name || '', material_name: cMap[x.consumable_id]?.material_name || '' }));
+        r = { list };
+      } else {
+        r = await api('/sku-mappings' + (q ? `?q=${encodeURIComponent(q)}` : ''));
+      }
       if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无映射</div>';
       listEl.innerHTML = r.list.map(x => `
       <div class="list-item">
@@ -1928,7 +2407,11 @@ async function renderSkuMappings(container) {
       if (isAdmin()) {
         listEl.querySelectorAll('[data-act="del"]').forEach(b => b.onclick = async () => {
           if (!(await confirmBox('确定删除该映射？', true))) return;
-          try { await api('/sku-mappings/' + b.dataset.id, { method: 'DELETE' }); toast('已删除'); load(); }
+          try {
+            if (isCloud()) await fetch(`${SUPA_URL}/rest/v1/sku_mappings?id=eq.${b.dataset.id}`, { method: 'DELETE', headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}` } });
+            else await api('/sku-mappings/' + b.dataset.id, { method: 'DELETE' });
+            toast('已删除'); load();
+          }
           catch (e) { toast(e.message, true); }
         });
         if ($('#sm-add')) $('#sm-add').onclick = async () => {
@@ -1946,7 +2429,13 @@ async function renderSkuMappings(container) {
           $('#smf-pick').onclick = async () => {
             const q2 = trim($('#smf-code').value);
             if (!q2) return toast('请输入包材编码', true);
-            const rc = await api('/consumables?q=' + encodeURIComponent(q2));
+            let rc;
+            if (isCloud()) {
+              const list2 = await supa.rest('consumables', { select: 'id,name,material_name', filter: `or=(name=ilike.*${q2}*,material_name=ilike.*${q2}*)`, limit: 10 });
+              rc = { list: list2 };
+            } else {
+              rc = await api('/consumables?q=' + encodeURIComponent(q2));
+            }
             const area = $('#smf-picked');
             if (!rc.list.length) { area.innerHTML = '<div style="font-size:12px;color:var(--muted)">未找到</div>'; return; }
             area.innerHTML = rc.list.slice(0, 5).map(c => `<div class="sub-item" data-id="${c.id}" style="border:1px solid var(--border);border-radius:10px;margin-bottom:6px"><div class="s-text"><div class="s-name">${esc(c.name)}</div><div class="s-desc">${esc(c.material_name || '')}</div></div></div>`).join('');
@@ -1958,7 +2447,11 @@ async function renderSkuMappings(container) {
           $('#smf-save').onclick = async () => {
             const sku = trim($('#smf-sku').value);
             if (!sku || !cid) return toast('请填写 SKU 并选择包材', true);
-            try { await api('/sku-mappings', { method: 'POST', body: { sku, consumable_id: cid, note: trim($('#smf-note').value) } }); toast('已新增'); mask.remove(); load(); }
+            try {
+              if (isCloud()) await supa.insert('sku_mappings', { id: cloudWrite._uid(), sku, consumable_id: cid, note: trim($('#smf-note').value), created_by: getUser()?.id || null, created_at: cloudWrite._now(), updated_at: cloudWrite._now() });
+              else await api('/sku-mappings', { method: 'POST', body: { sku, consumable_id: cid, note: trim($('#smf-note').value) } });
+              toast('已新增'); mask.remove(); load();
+            }
             catch (e) { toast(e.message, true); }
           };
         };
