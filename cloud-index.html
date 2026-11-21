@@ -252,8 +252,14 @@ function encF(filter) {
     const col = m[1], op = m[2], val = m[3];
     if (val === '') return null;
     let enc;
-    if (op === 'in.') enc = val.split(',').map(v => encodeURIComponent(v)).join(',');
-    else enc = val.split('*').map(p => encodeURIComponent(p)).join('*');
+    if (op === 'in.' && val.startsWith('(') && val.endsWith(')')) {
+      // in.(a,b,c) 括号语法：逐个编码，保留括号逗号
+      enc = '(' + val.slice(1, -1).split(',').map(v => encodeURIComponent(v.replace(/[()]/g, ''))).join(',') + ')';
+    } else if (op === 'in.') {
+      enc = val.split(',').map(v => encodeURIComponent(v)).join(',');
+    } else {
+      enc = val.split('*').map(p => encodeURIComponent(p)).join('*');
+    }
     return `${col}=${op}${enc}`;
   };
   const out = [];
@@ -280,7 +286,7 @@ const supa = {
     const res = await fetch(url, { headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}` } });
     if (!res.ok) {
       const t = await res.text().catch(() => '');
-      throw new Error(`云端查询失败(${res.status}): ${t.slice(0, 80)}`);
+      throw new Error(`云端查询失败(${res.status}): ${t.slice(0, 100)} [URL:${url.slice(0, 150)}]`);
     }
     const data = await res.json();
     return single ? (data[0] || null) : data;
@@ -1117,10 +1123,16 @@ async function renderFGStock(container) {
           filter = filter ? filter + '&' + zf : zf;
         }
         const list = await supa.rest('finished_goods_stock', { select: 'sku,system_stock,ground_location,ground_quantity,high_shelf_location,high_shelf_quantity,pick_location,pick_quantity,new_quantity', filter, order: 'sku', limit: 500 });
-        const allSkus = list.map(x => `sku=eq.${x.sku}`).join(',');
-        const highRows = await supa.rest('finished_goods_stock_high_shelves', { select: 'sku,location,quantity', filter: allSkus ? 'or=(' + allSkus + ')' : 'sku=eq.__none__', order: 'created_at' });
+        // 高架明细：用 in= 批量查（最多 50 个一批），避免超长 or= 导致 400
         const highMap = {};
-        highRows.forEach(h => { (highMap[h.sku] = highMap[h.sku] || []).push({ location: h.location, quantity: h.quantity }); });
+        const skuList = list.map(x => x.sku).filter(Boolean);
+        if (skuList.length) {
+          for (let i = 0; i < skuList.length; i += 50) {
+            const batch = skuList.slice(i, i + 50);
+            const rows = await supa.rest('finished_goods_stock_high_shelves', { select: 'sku,location,quantity', filter: `sku=in.(${batch.join(',')})`, order: 'created_at', limit: 1000 });
+            rows.forEach(h => { (highMap[h.sku] = highMap[h.sku] || []).push({ location: h.location, quantity: h.quantity }); });
+          }
+        }
         const sum = (a, k) => a.reduce((s, x) => s + (Number(x[k]) || 0), 0);
         const fullList = list.length === 500 ? [] : list; // 简化：云端搜索模式下统计基于当前结果
         r = {
@@ -2419,9 +2431,14 @@ async function renderSkuMappings(container) {
       if (isCloud()) {
         const f = q ? `sku=ilike.*${q}*&select=smb` : '';
         const list0 = await supa.rest('sku_mappings', { select: 'id,sku,consumable_id,note', filter: q ? `sku=ilike.*${q}*` : '', order: 'created_at.desc', limit: 500 });
-        // 关联耗材名
-        const cids = [...new Set(list0.map(x => x.consumable_id))];
-        const cons = cids.length ? await supa.rest('consumables', { select: 'id,name,material_name', filter: 'or=(' + cids.map(i => `id=eq.${i}`).join(',') + ')' }) : [];
+        // 关联耗材名（用 in= 批量，避免超长 or= 400）
+        const cids = [...new Set(list0.map(x => x.consumable_id).filter(Boolean))];
+        let cons = [];
+        for (let i = 0; i < cids.length; i += 50) {
+          const batch = cids.slice(i, i + 50);
+          const rr = await supa.rest('consumables', { select: 'id,name,material_name', filter: `id=in.(${batch.map(c => c.replace(/[(),]/g, '')).join(',')})`, limit: 200 });
+          cons = cons.concat(rr);
+        }
         const cMap = Object.fromEntries(cons.map(c => [c.id, c]));
         const list = list0.map(x => ({ ...x, consumable_name: cMap[x.consumable_id]?.name || '', material_name: cMap[x.consumable_id]?.material_name || '' }));
         r = { list };
