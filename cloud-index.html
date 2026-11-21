@@ -48,6 +48,7 @@ ul,li{list-style:none}
 .tabbar a{flex:1;display:flex;flex-direction:column;align-items:center;gap:2px;padding:7px 0 5px;color:var(--muted);font-size:11px}
 .tabbar a .ico{font-size:22px;line-height:1}
 .tabbar a.active{color:var(--primary);font-weight:600}
+.has-tab{padding-bottom:90px}
 
 /* 徽标 */
 .badge{display:inline-flex;align-items:center;gap:3px;font-size:11px;padding:2px 9px;border-radius:999px;font-weight:500}
@@ -199,7 +200,147 @@ select.inp{appearance:none;background:#fff url("data:image/svg+xml,%3Csvg xmlns=
 </head>
 <body>
 <div id="app"></div>
+<script src="/scanner.js"></script>
+<script src="/excel.js"></script>
 <script>
+'use strict';
+/* 通用扫码组件（浏览器原生 BarcodeDetector + getUserMedia 摄像头方案）
+ * 用法：在输入框后放一个按钮 onclick="scanCode('输入框id')"
+ * 成功后自动填入输入框并触发 input/change 事件
+ */
+async function scanCode(targetId) {
+  const target = document.getElementById(targetId);
+  if (!target) return toast('扫码目标输入框不存在', true);
+
+  // 检测支持性
+  if (!('BarcodeDetector' in window)) {
+    toast('当前浏览器不支持原生扫码，请改用手动输入或用安卓 Chrome/Edge 打开', true);
+    return;
+  }
+  // 先申请摄像头
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false,
+    });
+  } catch (e) {
+    toast('无法访问摄像头：' + (e.message || '请在浏览器设置里允许摄像头权限'), true);
+    return;
+  }
+
+  // 全屏扫码层
+  const layer = document.createElement('div');
+  layer.style.cssText = 'position:fixed;inset:0;z-index:9999;background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center';
+  layer.innerHTML = `
+    <div style="color:#fff;font-size:16px;font-weight:700;margin-bottom:12px">将条码对准框内</div>
+    <div style="position:relative;width:82vw;max-width:420px;aspect-ratio:1;border:3px solid rgba(255,255,255,.9);border-radius:14px;overflow:hidden;box-shadow:0 0 0 9999px rgba(0,0,0,.45)">
+      <video autoplay playsinline muted style="width:100%;height:100%;object-fit:cover"></video>
+      <div style="position:absolute;left:8%;right:8%;top:50%;height:2px;background:var(--primary,#3b82f6);box-shadow:0 0 8px rgba(59,130,246,.8);animation:scanline 1.6s ease-in-out infinite"></div>
+    </div>
+    <div style="color:rgba(255,255,255,.6);font-size:12px;margin-top:16px">自动识别 · 支持二维码/条形码</div>
+    <button id="scan-cancel" style="margin-top:22px;padding:10px 28px;border-radius:999px;background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);font-size:14px">取 消</button>
+    <style>@keyframes scanline{0%,100%{top:20%}50%{top:78%}}</style>`;
+  document.body.appendChild(layer);
+
+  const video = layer.querySelector('video');
+  video.srcObject = stream;
+  await video.play();
+
+  let detector = null;
+  try {
+    const fmts = await window.BarcodeDetector.getSupportedFormats();
+    detector = new window.BarcodeDetector({ formats: fmts.length ? fmts : ['code_128', 'code_39', 'ean_13', 'qr_code'] });
+  } catch { detector = new window.BarcodeDetector(); }
+
+  const stop = () => {
+    clearInterval(timer);
+    stream.getTracks().forEach(t => t.stop());
+    layer.remove();
+  };
+  layer.querySelector('#scan-cancel').onclick = stop;
+
+  const timer = setInterval(async () => {
+    try {
+      const codes = await detector.detect(video);
+      if (codes && codes.length) {
+        const val = codes[0].rawValue;
+        if (val) {
+          stop();
+          target.value = val;
+          target.dispatchEvent(new Event('input', { bubbles: true }));
+          target.dispatchEvent(new Event('change', { bubbles: true }));
+          toast('已识别：' + val);
+          // 若输入框有关联的查询/搜索按钮，自动点
+          const sib = target.parentElement && target.parentElement.querySelector('button');
+          if (sib && /search|查询|搜索/i.test(sib.textContent)) sib.click();
+        }
+      }
+    } catch { /* 单帧识别失败忽略 */ }
+  }, 220);
+}
+
+'use strict';
+/* Excel 导入导出工具（纯前端，SheetJS CDN）
+ * 用法：
+ *   导出：exportExcel([{编码:1,库存:2},...], '文件名', 'Sheet名')
+ *   导入：<input type="file" onchange="importExcel(this, (rows)=>{...})">
+ */
+function loadXLSX() {
+  if (window.XLSX) return Promise.resolve(window.XLSX);
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js';
+    s.onload = () => resolve(window.XLSX);
+    s.onerror = () => reject(new Error('Excel 组件加载失败，请检查网络'));
+    document.head.appendChild(s);
+  });
+}
+
+async function exportExcel(rows, filename = '导出数据', sheetName = 'Sheet1') {
+  if (!rows || !rows.length) return toast('没有数据可导出', true);
+  try {
+    const XLSX = await loadXLSX();
+    const ws = XLSX.utils.json_to_sheet(rows);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, sheetName);
+    XLSX.writeFile(wb, filename.endsWith('.xlsx') ? filename : filename + '.xlsx');
+    toast('已导出 ' + rows.length + ' 行');
+  } catch (e) { toast('导出失败：' + e.message, true); }
+}
+
+async function importExcel(input, onRows) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  try {
+    const XLSX = await loadXLSX();
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(buf, { type: 'array' });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+    if (!rows.length) return toast('文件为空或格式不对', true);
+    onRows(rows);
+  } catch (e) { toast('导入失败：' + e.message, true); }
+  input.value = ''; // 允许重复选同一文件
+}
+
+/* CSV 导出兜底（不用 CDN） */
+function exportCSV(rows, filename = '导出数据') {
+  if (!rows || !rows.length) return toast('没有数据可导出', true);
+  const cols = Object.keys(rows[0]);
+  const csv = [cols.join(','), ...rows.map(r => cols.map(c => {
+    const v = r[c] == null ? '' : String(r[c]);
+    return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+  }).join(','))].join('\n');
+  const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename.endsWith('.csv') ? filename : filename + '.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+  toast('已导出 ' + rows.length + ' 行');
+}
+
 /* 「小安」仓库管理 v2 - 移动端单页应用（全量复刻线上版） */
 'use strict';
 
@@ -275,22 +416,30 @@ function encF(filter) {
   return out.join('&');
 }
 
-/* Supabase REST 直连工具（云端模式专用） */
+/* Supabase REST 直连工具（云端模式专用）
+ * 含 15 秒内存缓存：同一页面重复切换不重复请求（提升切页速度） */
+const _supaCache = new Map();
 const supa = {
-  async rest(table, { select = '*', filter = '', order = '', limit = 0, single = false } = {}) {
+  async rest(table, { select = '*', filter = '', order = '', limit = 0, single = false, cacheMs = 15000 } = {}) {
     let url = `${SUPA_URL}/rest/v1/${table}?select=${encodeURIComponent(select)}`;
     const ef = encF(filter);
     if (ef) url += '&' + ef;
     if (order) url += '&order=' + order;
     if (limit) url += '&limit=' + limit;
+    // 缓存命中（写操作后由 invalidateCache 清理）
+    const hit = _supaCache.get(url);
+    if (hit && Date.now() - hit.t < cacheMs) return single ? (hit.d[0] || null) : hit.d;
     const res = await fetch(url, { headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}` } });
     if (!res.ok) {
       const t = await res.text().catch(() => '');
       throw new Error(`云端查询失败(${res.status}): ${t.slice(0, 100)} [URL:${url.slice(0, 150)}]`);
     }
     const data = await res.json();
+    _supaCache.set(url, { t: Date.now(), d: data });
+    if (_supaCache.size > 100) { const k = _supaCache.keys().next().value; _supaCache.delete(k); }
     return single ? (data[0] || null) : data;
   },
+  invalidate() { _supaCache.clear(); },
   async insert(table, row) {
     const res = await fetch(`${SUPA_URL}/rest/v1/${table}`, {
       method: 'POST',
@@ -338,6 +487,7 @@ const cloudWrite = {
     }
   },
   async _log(module, sku, content) {
+    supa.invalidate(); // 写操作后清查询缓存，保证下次读到最新
     const u = getUser();
     await supa.insert('unified_operation_logs', {
       id: this._uid(), module_name: module, operator: u?.username || '', sku: sku || null,
@@ -672,7 +822,7 @@ function renderLogin() {
 async function renderHome(container) {
   const u = getUser();
   container.innerHTML = navbar('首页', false, `<a href="#/home-sort" style="font-size:12px;color:var(--muted-foreground)">↕️ 排序</a>`) + `
-  <div class="page-body" id="home-body"><div class="loading">加载中...</div></div>`;
+  <div class="page-body has-tab" id="home-body"><div class="loading">加载中...</div></div>` + tabbar('home');
   try {
     let d, stats;
     if (isCloud()) {
@@ -756,6 +906,8 @@ function renderAccordions(u) {
     ]},
     { key: 'reno', title: '翻新管理', ico: '♻️', cls: 'var(--green-soft)', adminOnly: false, items: [
       { name: '翻新后库存查询', desc: '状态/成色筛选', href: '#/reno-inventory' },
+      { name: '待翻新拣货', desc: '拣货任务/子任务进度', href: '#/reno-picking' },
+      { name: '翻新主数据管理', desc: '分类/绑定/无需翻新', href: '#/reno-master' },
       { name: '翻新后出库匹配', desc: '匹配出库与扣减库存', href: '#/reno-outbound' },
       { name: '翻新后上架作业', desc: '扫码SKU上架到货架', href: '#/reno-putaway' },
       { name: '翻新后移库操作', desc: '翻新后储位间互相移库', href: '#/reno-transfer' },
@@ -804,8 +956,8 @@ function bindAccordions() { /* toggleAcc 内联调用即可 */ }
 
 /* ===== 记录页 ===== */
 async function renderRecords(container) {
-  container.innerHTML = navbar('记录', false) + `
-  <div class="page-body">
+  container.innerHTML = navbar('记录', false, `<button class="btn tiny ghost" id="rc-export">⬇️ 导出</button>`) + `
+  <div class="page-body has-tab">
     <div class="card">
       <div class="card-title" style="margin-bottom:10px">筛选查询</div>
       <div class="field"><label>模块</label>
@@ -819,7 +971,15 @@ async function renderRecords(container) {
       <button class="btn primary" id="rc-search">查 询</button>
     </div>
     <div id="rc-list"><div class="loading">加载中...</div></div>
-  </div>`;
+  </div>` + tabbar('records');
+  let lastRecs = [];
+  $('#rc-export').onclick = () => {
+    if (!lastRecs.length) return toast('请先查询出数据', true);
+    exportExcel(lastRecs.map(x => ({
+      '模块': x.module_name || '', '时间': (x.operation_time || '').replace('T', ' ').slice(0, 19),
+      '操作人': x.operator || '', 'SKU': x.sku || '', '内容': x.operation_content || '',
+    })), '操作记录', '记录');
+  };
   const load = async () => {
     const params = new URLSearchParams();
     if ($('#rc-module').value) params.set('module', $('#rc-module').value);
@@ -852,6 +1012,7 @@ async function renderRecords(container) {
         mods.forEach(m => { const o = document.createElement('option'); o.value = m; o.textContent = m; sel.appendChild(o); });
       }
       document.querySelector('.card-title').textContent = `筛选查询（共 ${r.total.toLocaleString()} 条）`;
+      lastRecs = r.list;
       if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无记录</div>';
       listEl.innerHTML = r.list.map(x => `
       <div class="list-item">
@@ -876,7 +1037,7 @@ function renderMe(container) {
     <div class="p-name">${esc(u.username)}</div>
     <div class="p-sub">${esc(ROLE_NAME[u.role] || u.role)} · ${u.permissions?.length || 0} 项权限</div>
   </div>
-  <div class="page-body">
+  <div class="page-body has-tab">
     <div class="card" style="padding:4px 14px">
       <a class="menu-item" href="#/users"><span class="m-ico">👥</span><span class="m-text">账号管理</span><span class="m-arrow">›</span></a>
     </div>
@@ -891,8 +1052,8 @@ function renderMe(container) {
     <div class="card" style="padding:4px 14px">
       <button class="btn ghost" id="me-logout" style="border:none;color:var(--red);height:48px">退出登录</button>
     </div>
-    <div style="text-align:center;font-size:11px;color:var(--muted);margin-top:12px">耗材管理系统 v2.0.0</div>
-  </div>`;
+    <div style="text-align:center;font-size:11px;color:var(--muted);margin-top:12px">小安仓库管理 v2.1.0</div>
+  </div>` + tabbar('me');
   $('#me-logout').onclick = async () => {
     if (!(await confirmBox('确定退出登录吗？'))) return;
     try { await api('/auth/logout', { method: 'POST', body: {} }); } catch {}
@@ -902,12 +1063,21 @@ function renderMe(container) {
 
 /* ===== 耗材列表 ===== */
 async function renderConsumables(container) {
-  container.innerHTML = navbar('耗材库存', true, isAdmin() ? `<button class="btn tiny primary" id="c-add">+ 新增</button>` : '') + `
+  container.innerHTML = navbar('耗材库存', true, `${isAdmin() ? '<button class="btn tiny primary" id="c-add">+ 新增</button>' : ''}<button class="btn tiny ghost" id="c-export">⬇️ 导出</button>`) + `
   <div class="page-body">
-    <div class="search-bar"><input class="inp" id="c-q" placeholder="搜索名称 / 编码 / 储位"><button class="btn primary" id="c-search">搜索</button></div>
+    <div class="search-bar"><input class="inp" id="c-q" placeholder="搜索名称 / 编码 / 储位"><button class="btn ghost" onclick="scanCode('c-q')">📷</button><button class="btn primary" id="c-search">搜索</button></div>
     <div id="c-stats"><div class="loading">加载中...</div></div>
     <div id="c-list"></div>
   </div>`;
+  let lastList = [];
+  $('#c-export').onclick = () => {
+    if (!lastList.length) return toast('请先加载数据', true);
+    exportExcel(lastList.map(x => ({
+      '包材编码': x.name || '', '分类': x.category || '', '规格': x.spec || '', '单位': x.unit || '',
+      '库存': x.stock || 0, '安全库存': x.safety_stock || 0, '储位': x.shelf_code || '',
+      '物料名': x.material_name || '', 'MOQ': x.moq || 0,
+    })), '耗材库存', '耗材');
+  };
   const load = async () => {
     const listEl = $('#c-list'), statEl = $('#c-stats');
     listEl.innerHTML = '<div class="loading">加载中...</div>';
@@ -935,7 +1105,8 @@ async function renderConsumables(container) {
         <div class="stat-card"><div class="label">库存总量</div><div class="value">${fmtQty(Math.round(r.stats.totalStock))}</div></div>
         <div class="stat-card" style="${r.stats.low ? 'color:var(--red)' : ''}"><div class="label">低库存</div><div class="value" style="${r.stats.low ? 'color:var(--red)' : ''}">${fmtQty(r.stats.low)}</div></div>
       </div>`;
-      if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>未找到耗材</div>';
+      if (!r.list.length) { lastList = []; return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>未找到耗材</div>'; }
+      lastList = r.list;
       listEl.innerHTML = r.list.map((c, i) => {
         const low = c.stock < c.safety_stock;
         return `
@@ -1016,11 +1187,11 @@ async function renderStockIO(container, query) {
   const wrap = $('#io-form');
   wrap.innerHTML = `
     <div class="field"><label class="req">耗材 / 包材编码</label>
-      <div class="input-group"><span class="ig-ico">🔎</span><input id="io-code" placeholder="输入编码搜索"><button class="btn tiny ghost" id="io-pick">搜索</button></div>
+      <div class="input-group"><span class="ig-ico">🔎</span><input id="io-code" placeholder="输入编码搜索"><button class="btn tiny ghost" onclick="scanCode('io-code')">📷</button><button class="btn tiny ghost" id="io-pick">搜索</button></div>
       <div id="io-picked" style="margin-top:8px"></div></div>
     <div class="field"><label class="req">${type === 'in' ? '入库' : '出库'}数量</label><input class="inp" id="io-qty" type="number" min="0.01" step="any"></div>
     <div class="field"><label>储位编码（引导前往核对）</label>
-      <div class="input-group"><span class="ig-ico">📍</span><input id="io-shelf" placeholder="储位编码"></div></div>
+      <div class="input-group"><span class="ig-ico">📍</span><input id="io-shelf" placeholder="储位编码"><button class="btn tiny ghost" onclick="scanCode('io-shelf')">📷</button></div></div>
     ${type === 'out' ? `
     <div class="field"><label>领用人</label><input class="inp" id="io-receiver" placeholder="领用人"></div>
     <div class="field"><label>用途/备注</label><textarea class="inp" id="io-reason" placeholder="用途/备注"></textarea></div>` : `
@@ -1091,9 +1262,9 @@ async function renderStockIO(container, query) {
 
 /* ===== 实物库存查询 ===== */
 async function renderFGStock(container) {
-  container.innerHTML = navbar('实物库存查询', true) + `
+  container.innerHTML = navbar('实物库存查询', true, `<button class="btn tiny ghost" id="fg-export">⬇️ 导出</button>`) + `
   <div class="page-body">
-    <div class="search-bar"><input class="inp" id="fg-q" placeholder="SKU / 储位号"><button class="btn primary" id="fg-search">搜索</button></div>
+    <div class="search-bar"><input class="inp" id="fg-q" placeholder="SKU / 储位号"><button class="btn ghost" onclick="scanCode('fg-q')">📷</button><button class="btn primary" id="fg-search">搜索</button></div>
     <div id="fg-stats"><div class="loading">加载中...</div></div>
     <div class="filter-row" id="fg-zone">
       <button class="chip active" data-v="">全部储区</button>
@@ -1104,6 +1275,20 @@ async function renderFGStock(container) {
     <div id="fg-list"></div>
   </div>`;
   let zone = '';
+  let lastFgList = [], lastHighMap = {};
+  $('#fg-export').onclick = () => {
+    if (!lastFgList.length) return toast('请先加载数据', true);
+    exportExcel(lastFgList.map(f => {
+      const highs = (lastHighMap[f.sku] || []);
+      const phy = (Number(f.ground_quantity) || 0) + (Number(f.high_shelf_quantity) || 0) + (Number(f.pick_quantity) || 0);
+      return {
+        'SKU': f.sku, '系统库存': f.system_stock || 0, '实物总量': phy,
+        '地堆位': f.ground_location || '-', '地堆数量': f.ground_quantity || 0,
+        '高架位': highs.map(h => h.location).join(' / ') || '-', '高架数量': highs.map(h => h.quantity).join(' / ') || (f.high_shelf_quantity || 0),
+        '拣货位': f.pick_location || '-', '拣货数量': f.pick_quantity || 0,
+      };
+    }), '实物库存', '库存');
+  };
   const load = async () => {
     const listEl = $('#fg-list'), statEl = $('#fg-stats');
     listEl.innerHTML = '<div class="loading">加载中...</div>';
@@ -1155,7 +1340,8 @@ async function renderFGStock(container) {
         <div class="stat-card"><div class="label">📊 逆向总库存</div><div class="value">${fmtQty(s.totalQty)}</div><div class="sub">地堆 ${fmtQty(s.groundQty)} · 高架 ${fmtQty(s.highQty)} · 拣货 ${fmtQty(s.pickQty)}</div></div>
       </div>
       <div class="stat-card" style="margin-bottom:12px;background:linear-gradient(135deg,#f0fdf4,#dcfce7)"><div class="label">✨ 全新品</div><div class="value" style="color:var(--green)">${fmtQty(s.newQty)}</div></div>`;
-      if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>未找到库存记录</div>';
+      if (!r.list.length) { lastFgList = []; return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>未找到库存记录</div>'; }
+      lastFgList = r.list; lastHighMap = r.highMap;
       listEl.innerHTML = r.list.map(f => {
         const highs = (r.highMap[f.sku] || []);
         const phy = (Number(f.ground_quantity) || 0) + (Number(f.high_shelf_quantity) || 0) + (Number(f.pick_quantity) || 0);
@@ -1199,13 +1385,13 @@ async function renderPutaway(container) {
       <div style="display:flex;gap:10px;align-items:flex-start;margin-bottom:14px">
         <div style="width:26px;height:26px;border-radius:50%;background:var(--primary);color:#fff;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;flex-shrink:0">1</div>
         <div style="flex:1"><div style="font-weight:700;margin-bottom:8px">扫描商品SKU条码</div>
-          <div class="input-group"><span class="ig-ico">📦</span><input id="pa-sku" placeholder="输入 SKU"><button class="btn tiny primary" id="pa-query">查询</button></div>
+          <div class="input-group"><span class="ig-ico">📦</span><input id="pa-sku" placeholder="输入 SKU"><button class="btn tiny ghost" onclick="scanCode('pa-sku')">📷</button><button class="btn tiny primary" id="pa-query">查询</button></div>
           <div id="pa-info" style="margin-top:8px"></div></div>
       </div>
       <div style="display:flex;gap:10px;align-items:flex-start;margin-bottom:14px">
         <div style="width:26px;height:26px;border-radius:50%;background:var(--primary);color:#fff;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;flex-shrink:0">3</div>
         <div style="flex:1"><div style="font-weight:700;margin-bottom:8px">扫描储位并提交</div>
-          <div class="input-group"><span class="ig-ico">📍</span><input id="pa-loc" placeholder="目标储位"></div>
+          <div class="input-group"><span class="ig-ico">📍</span><input id="pa-loc" placeholder="目标储位"><button class="btn tiny ghost" onclick="scanCode('pa-loc')">📷</button></div>
           <div id="pa-loctype" style="margin-top:6px;font-size:12px"></div>
           <div class="field" style="margin-top:10px"><label class="req">本次上架数量</label><input class="inp" id="pa-qty" type="number" min="1"></div>
           <button class="btn primary" id="pa-submit">提交上架</button></div>
@@ -1270,11 +1456,11 @@ async function renderFGPicking(container) {
   <div class="page-body">
     <div class="card">
       <div class="field"><label class="req">SKU</label>
-        <div class="input-group"><span class="ig-ico">📦</span><input id="pk-sku" placeholder="输入 SKU"><button class="btn tiny primary" id="pk-query">查询</button></div></div>
+        <div class="input-group"><span class="ig-ico">📦</span><input id="pk-sku" placeholder="输入 SKU"><button class="btn tiny ghost" onclick="scanCode('pk-sku')">📷</button><button class="btn tiny primary" id="pk-query">查询</button></div></div>
       <div id="pk-info" style="margin-bottom:12px"></div>
       <div class="field"><label class="req">出库数量</label><input class="inp" id="pk-qty" type="number" min="1"></div>
       <div class="field"><label class="req">出库储位</label>
-        <div class="input-group"><span class="ig-ico">📍</span><input id="pk-loc" placeholder="选择或输入储位"></div>
+        <div class="input-group"><span class="ig-ico">📍</span><input id="pk-loc" placeholder="选择或输入储位"><button class="btn tiny ghost" onclick="scanCode('pk-loc')">📷</button></div>
         <div id="pk-locs" style="margin-top:8px"></div></div>
       <div class="field"><label>性质</label>
         <select class="inp" id="pk-nature"><option value="不良品">不良品</option><option value="全新品">全新品</option></select></div>
@@ -1339,11 +1525,11 @@ async function renderTransfer(container) {
   <div class="page-body">
     <div class="card">
       <div class="field"><label class="req">SKU</label>
-        <div class="input-group"><span class="ig-ico">📦</span><input id="tr-sku" placeholder="输入 SKU"><button class="btn tiny primary" id="tr-query">查询</button></div></div>
+        <div class="input-group"><span class="ig-ico">📦</span><input id="tr-sku" placeholder="输入 SKU"><button class="btn tiny ghost" onclick="scanCode('tr-sku')">📷</button><button class="btn tiny primary" id="tr-query">查询</button></div></div>
       <div id="tr-info" style="margin-bottom:12px"></div>
       <div class="field"><label class="req">源储位</label>
         <div id="tr-from-list"></div></div>
-      <div class="field"><label class="req">目标储位</label><input class="inp" id="tr-to" placeholder="目标储位编码"></div>
+      <div class="field"><label class="req">目标储位</label><input class="inp" id="tr-to" placeholder="目标储位编码"><button class="btn tiny ghost" onclick="scanCode('tr-to')" style="margin-left:6px">📷</button></div>
       <div class="field"><label class="req">移库数量</label><input class="inp" id="tr-qty" type="number" min="1"></div>
       <button class="btn primary" id="tr-submit">确认移库</button>
     </div>
@@ -1959,7 +2145,7 @@ async function renderFGInventory(container) {
     <div class="card">
       <div style="font-size:13px;color:var(--muted-foreground);margin-bottom:10px">逐件/批量盘点成品实物：录入实盘数量，自动计算差异，勾选"校准"将直接修正库存</div>
       <div class="field"><label class="req">SKU</label>
-        <div class="input-group"><span class="ig-ico">📦</span><input id="fi-sku" placeholder="输入 SKU"><button class="btn tiny primary" id="fi-query">查询</button></div></div>
+        <div class="input-group"><span class="ig-ico">📦</span><input id="fi-sku" placeholder="输入 SKU"><button class="btn tiny ghost" onclick="scanCode('fi-sku')">📷</button><button class="btn tiny primary" id="fi-query">查询</button></div></div>
       <div id="fi-info" style="margin-bottom:12px"></div>
       <div class="field"><label class="req">盘点储位</label><input class="inp" id="fi-loc" placeholder="储位编码"></div>
       <div class="field"><label class="req">实盘数量</label><input class="inp" id="fi-actual" type="number" placeholder="实盘数量"></div>
@@ -2010,7 +2196,7 @@ async function renderFGInventory(container) {
 async function renderConInventory(container) {
   container.innerHTML = navbar('包材库存盘点', true) + `
   <div class="page-body">
-    <div class="search-bar"><input class="inp" id="ci-q" placeholder="编码 / 储位"><button class="btn primary" id="ci-search">搜索</button></div>
+    <div class="search-bar"><input class="inp" id="ci-q" placeholder="编码 / 储位"><button class="btn ghost" onclick="scanCode('ci-q')">📷</button><button class="btn primary" id="ci-search">搜索</button></div>
     <div id="ci-list"><div class="loading">加载中...</div></div>
   </div>`;
   const load = async () => {
@@ -2563,6 +2749,8 @@ async function route() {
       case '/distr-work': await renderDistrWork(container); break;
       case '/distr-stats': await renderDistrStats(container); break;
       case '/change-password': await renderChangePassword(container); break;
+      case '/reno-picking': await renderRenoPicking(container); break;
+      case '/reno-master': await renderRenoMaster(container); break;
       case '/home-sort': await renderHomeSort(container); break;
       default:
         container.innerHTML = navbar('提示', true) + '<div class="page-body"><div class="empty"><span class="emoji">🚧</span>页面开发中</div></div>';
@@ -2571,6 +2759,78 @@ async function route() {
     container.innerHTML = navbar('出错了', true) + `<div class="page-body"><div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div></div>`;
   }
 }
+
+/* ===== 待翻新拣货（任务列表 + 子任务明细）===== */
+async function renderRenoPicking(container) {
+  const detailId = new URLSearchParams(location.hash.split('?')[1] || '').get('task');
+  container.innerHTML = navbar('待翻新拣货', true) + `<div class="page-body has-tab"><div id="pk-tasks"><div class="loading">加载中...</div></div></div>`;
+  if (isCloud()) {
+    const el = $('#pk-tasks');
+    if (detailId) {
+      // 子任务明细
+      const subs = await supa.rest('refurbish_picking_subtasks', { select: 'subtask_no,sku,category,plan_quantity,picked_quantity,status,assigned_to,last_picked_location', filter: `task_id=eq.${detailId}`, order: 'subtask_no', limit: 500 });
+      el.innerHTML = `<div style="margin-bottom:10px"><a href="#/reno-picking" style="color:var(--primary);font-size:13px">‹ 返回任务列表</a></div>` +
+        (subs.length ? subs.map(s => {
+          const done = s.status === 'completed';
+          const pct = Number(s.plan_quantity) ? Math.round(Number(s.picked_quantity) / Number(s.plan_quantity) * 100) : 0;
+          return `<div class="list-item">
+            <div class="li-head"><span class="li-name">${esc(s.sku || s.subtask_no)}</span>
+              <span class="badge ${done ? 'teal' : (Number(s.picked_quantity) > 0 ? 'gray' : 'red')}">${done ? '已完成' : (Number(s.picked_quantity) > 0 ? '进行中' : '待拣货')}</span></div>
+            <div class="li-row"><span>计划:<b>${fmtQty(s.plan_quantity)}</b></span><span>已拣:<b>${fmtQty(s.picked_quantity)}</b></span><span>进度:<b>${pct}%</b></span></div>
+            ${s.category ? `<div class="li-row"><span>分类:${esc(s.category)}</span>${s.assigned_to ? `<span>拣货员:${esc(s.assigned_to)}</span>` : ''}</div>` : ''}
+            ${s.last_picked_location ? `<div class="li-row"><span>最近储位:<b>${esc(s.last_picked_location)}</b></span></div>` : ''}
+          </div>`;
+        }).join('') : '<div class="empty"><span class="emoji">📭</span>该任务无子任务</div>');
+      return;
+    }
+    // 任务列表
+    const tasks = await supa.rest('refurbish_picking_tasks', { select: 'id,task_no,title,total_skus,total_quantity,picked_quantity,status,created_at', order: 'created_at.desc', limit: 100 });
+    el.innerHTML = tasks.length ? tasks.map(t => {
+      const done = t.status === 'completed';
+      const pct = Number(t.total_quantity) ? Math.round(Number(t.picked_quantity) / Number(t.total_quantity) * 100) : 0;
+      return `<div class="list-item" style="cursor:pointer" onclick="location.hash='#/reno-picking?task=${encodeURIComponent(t.id)}'">
+        <div class="li-head"><span class="li-name" style="font-size:13px">${esc(t.task_no)}</span>
+          <span class="badge ${done ? 'teal' : 'gray'}">${done ? '已完成' : '进行中'}</span></div>
+        <div class="li-row"><span>SKU数:<b>${fmtQty(t.total_skus)}</b></span><span>总量:<b>${fmtQty(t.total_quantity)}</b></span><span>已拣:<b>${fmtQty(t.picked_quantity)}</b></span></div>
+        <div style="height:5px;background:var(--border);border-radius:3px;margin-top:6px;overflow:hidden"><div style="height:100%;width:${pct}%;background:${done ? 'var(--green)' : 'var(--primary)'}"></div></div>
+        <div class="li-row" style="margin-top:4px"><span style="font-size:11px;color:var(--muted)">${esc((t.created_at || '').replace('T', ' ').slice(0, 10))}</span></div>
+      </div>`;
+    }).join('') : '<div class="empty"><span class="emoji">📭</span>暂无拣货任务</div>';
+  } else {
+    try {
+      const r = await api('/reno-picking-tasks');
+      $('#pk-tasks').innerHTML = (r.list || []).map(t => `<div class="list-item"><div class="li-head"><span class="li-name">${esc(t.task_no)}</span><span class="badge ${t.status === 'completed' ? 'teal' : 'gray'}">${t.status === 'completed' ? '已完成' : '进行中'}</span></div><div class="li-row"><span>SKU:${fmtQty(t.total_skus)}</span><span>已拣/总:${fmtQty(t.picked_quantity)}/${fmtQty(t.total_quantity)}</span></div></div>`).join('') || '<div class="empty">暂无任务</div>';
+    } catch (e) { $('#pk-tasks').innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+  }
+}
+
+/* ===== 翻新主数据管理（分类 + 绑定总览）===== */
+async function renderRenoMaster(container) {
+  container.innerHTML = navbar('翻新主数据管理', true) + `<div class="page-body has-tab">
+    <div class="card"><div class="card-title">翻新分类</div><div id="rm-cats"><div class="loading">加载中...</div></div></div>
+    <div class="card" style="margin-top:12px"><div class="card-title">SKU 包材绑定总览</div><div id="rm-binds"><div class="loading">加载中...</div></div></div>
+  </div>`;
+  if (isCloud()) {
+    try {
+      const [cats, binds, noReno] = await Promise.all([
+        supa.rest('refurbish_categories', { select: 'category_name,is_active,sort_order', order: 'sort_order', limit: 50 }),
+        supa.rest('sku_consumable_bindings', { select: '*', limit: 500 }),
+        supa.rest('no_renovation_skus', { select: 'sku', limit: 1000 }),
+      ]);
+      $('#rm-cats').innerHTML = cats.length ? cats.map(c => `<div class="li-row"><span>${esc(c.category_name)}</span><span class="badge ${c.is_active ? 'teal' : 'red'}">${c.is_active ? '启用' : '停用'}</span></div>`).join('') : '<div class="empty">无分类</div>';
+      const bindCount = binds ? binds.length : 0;
+      $('#rm-binds').innerHTML = bindCount ? `<div class="li-row"><span>绑定记录:<b>${fmtQty(bindCount)}</b></span></div>${binds.slice(0, 30).map(b => `<div class="li-row"><span>${esc(JSON.stringify(Object.values(b).slice(1, 4)).replace(/["\[\]]/g, ''))}</span></div>`).join('')}<div style="font-size:11px;color:var(--muted);margin-top:6px">仅显示前 30 条</div>` : '<div class="empty">暂无绑定数据</div>';
+      const div = document.createElement('div');
+      div.className = 'card'; div.style.marginTop = '12px';
+      div.innerHTML = `<div class="card-title">无需翻新 SKU 列表（${noReno.length}）</div><div style="max-height:200px;overflow:auto;font-size:12px;color:var(--muted-foreground)">${noReno.slice(0, 100).map(x => esc(x.sku)).join('、')}</div>${noReno.length > 100 ? '<div style="font-size:11px;margin-top:4px">… 共 ' + noReno.length + ' 个</div>' : ''}`;
+      container.querySelector('.page-body').appendChild(div);
+    } catch (e) { $('#rm-cats').innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+  } else {
+    $('#rm-cats').innerHTML = '<div class="empty">请在云端模式使用（本地模式未实现）</div>';
+    $('#rm-binds').innerHTML = '<div class="empty">-</div>';
+  }
+}
+
 window.addEventListener('hashchange', route);
 route();
 
