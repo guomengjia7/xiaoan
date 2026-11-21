@@ -204,80 +204,168 @@ select.inp{appearance:none;background:#fff url("data:image/svg+xml,%3Csvg xmlns=
 <script src="/excel.js"></script>
 <script>
 'use strict';
-/* 通用扫码组件（浏览器原生 BarcodeDetector + getUserMedia 摄像头方案）
- * 用法：在输入框后放一个按钮 onclick="scanCode('输入框id')"
- * 成功后自动填入输入框并触发 input/change 事件
+/* 工业级扫码组件 v2 —— 准且快（对标微信扫码）
+ * 防误读：连续帧交叉验证 + 内容白名单校验
+ * 交互：双指缩放 / 点按对焦 / 手电筒 / 连续扫码
+ * 用法：scanCode('输入框id', 'sku|loc|code')  第三参限定内容类型
+ *   sku  → 只收能匹配云端 finished_goods_stock 的值（查无此 SKU 会提示但允许自查）
+ *   loc  → 只收 AA-/AB-/AC-/HC-/DD- 开头的储位编码
+ *   code → 耗材编码（数字/字母混合），宽松
  */
-async function scanCode(targetId) {
+async function scanCode(targetId, type) {
   const target = document.getElementById(targetId);
   if (!target) return toast('扫码目标输入框不存在', true);
-
-  // 检测支持性
   if (!('BarcodeDetector' in window)) {
-    toast('当前浏览器不支持原生扫码，请改用手动输入或用安卓 Chrome/Edge 打开', true);
-    return;
+    return toast('当前浏览器不支持扫码，请用安卓 Chrome/Edge/Safari 打开', true);
   }
-  // 先申请摄像头
+  type = type || guessType(targetId, target);
+  function guessType(id, el) {
+    if (/loc|shelf|储位/i.test(id) || /储位/i.test(el.placeholder || '')) return 'loc';
+    if (/sku/i.test(id)) return 'sku';
+    return 'code';
+  }
+
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
+      video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
       audio: false,
     });
   } catch (e) {
-    toast('无法访问摄像头：' + (e.message || '请在浏览器设置里允许摄像头权限'), true);
-    return;
+    return toast('无法访问摄像头：' + (e.message || '请允许摄像头权限'), true);
   }
+  const track = stream.getVideoTracks()[0];
+  const caps = track.getCapabilities ? track.getCapabilities() : {};
 
   // 全屏扫码层
   const layer = document.createElement('div');
-  layer.style.cssText = 'position:fixed;inset:0;z-index:9999;background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center';
+  layer.style.cssText = 'position:fixed;inset:0;z-index:9999;background:#000;display:flex;flex-direction:column';
   layer.innerHTML = `
-    <div style="color:#fff;font-size:16px;font-weight:700;margin-bottom:12px">将条码对准框内</div>
-    <div style="position:relative;width:82vw;max-width:420px;aspect-ratio:1;border:3px solid rgba(255,255,255,.9);border-radius:14px;overflow:hidden;box-shadow:0 0 0 9999px rgba(0,0,0,.45)">
-      <video autoplay playsinline muted style="width:100%;height:100%;object-fit:cover"></video>
-      <div style="position:absolute;left:8%;right:8%;top:50%;height:2px;background:var(--primary,#3b82f6);box-shadow:0 0 8px rgba(59,130,246,.8);animation:scanline 1.6s ease-in-out infinite"></div>
+    <div style="padding:calc(env(safe-area-inset-top) + 10px) 16px 8px;display:flex;justify-content:space-between;align-items:center">
+      <span style="color:#fff;font-size:15px;font-weight:700">${type === 'loc' ? '扫储位码' : type === 'sku' ? '扫 SKU 条码' : '扫码'}</span>
+      <button id="sc-cancel" style="background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:#fff;border-radius:999px;padding:5px 16px;font-size:13px">关闭</button>
     </div>
-    <div style="color:rgba(255,255,255,.6);font-size:12px;margin-top:16px">自动识别 · 支持二维码/条形码</div>
-    <button id="scan-cancel" style="margin-top:22px;padding:10px 28px;border-radius:999px;background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);font-size:14px">取 消</button>
-    <style>@keyframes scanline{0%,100%{top:20%}50%{top:78%}}</style>`;
+    <div id="sc-vp" style="position:relative;flex:1;overflow:hidden;display:flex;align-items:center;justify-content:center">
+      <video id="sc-video" autoplay playsinline muted style="width:100%;height:100%;object-fit:cover"></video>
+      <div style="position:absolute;width:78%;max-width:400px;aspect-ratio:1.1/1;border:2px solid rgba(255,255,255,.85);border-radius:16px;box-shadow:0 0 0 9999px rgba(0,0,0,.5);pointer-events:none">
+        <div style="position:absolute;left:6%;right:6%;top:50%;height:2px;background:#22d3ee;box-shadow:0 0 10px #22d3ee;animation:scLine 1.8s ease-in-out infinite"></div>
+        <div style="position:absolute;left:0;top:0;width:26px;height:26px;border-left:4px solid #22d3ee;border-top:4px solid #22d3ee;border-radius:6px 0 0 0"></div>
+        <div style="position:absolute;right:0;top:0;width:26px;height:26px;border-right:4px solid #22d3ee;border-top:4px solid #22d3ee;border-radius:0 6px 0 0"></div>
+        <div style="position:absolute;left:0;bottom:0;width:26px;height:26px;border-left:4px solid #22d3ee;border-bottom:4px solid #22d3ee;border-radius:0 0 0 6px"></div>
+        <div style="position:absolute;right:0;bottom:0;width:26px;height:26px;border-right:4px solid #22d3ee;border-bottom:4px solid #22d3ee;border-radius:0 0 6px 0"></div>
+      </div>
+      <div id="sc-tip" style="position:absolute;bottom:18px;left:0;right:0;text-align:center;color:#fff;font-size:12px;text-shadow:0 1px 3px #000">对准条码自动识别 · 双指缩放 · 点按对焦</div>
+    </div>
+    <div style="padding:10px 0 calc(env(safe-area-inset-bottom) + 14px);display:flex;justify-content:center;gap:30px">
+      ${caps.torch ? '<button id="sc-torch" style="background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.25);color:#fff;border-radius:50%;width:52px;height:52px;font-size:22px">🔦</button>' : ''}
+      <button id="sc-input" style="background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.25);color:#fff;border-radius:50%;width:52px;height:52px;font-size:20px">⌨️</button>
+    </div>
+    <style>@keyframes scLine{0%,100%{top:18%}50%{top:80%}}</style>`;
   document.body.appendChild(layer);
 
-  const video = layer.querySelector('video');
+  const video = layer.querySelector('#sc-video');
   video.srcObject = stream;
   await video.play();
 
-  let detector = null;
+  // 双指缩放
+  let scale = 1;
+  const vp = layer.querySelector('#sc-vp');
+  let pinchDist = 0, pinchScale = 1;
+  vp.addEventListener('touchstart', e => {
+    if (e.touches.length === 2) { pinchDist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY); pinchScale = scale; }
+  }, { passive: true });
+  vp.addEventListener('touchmove', e => {
+    if (e.touches.length === 2 && pinchDist) {
+      const d = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+      scale = Math.min(4, Math.max(1, pinchScale * d / pinchDist));
+      video.style.transform = `scale(${scale})`;
+      video.style.transition = 'none';
+    }
+  }, { passive: true });
+  // 点按对焦
+  vp.addEventListener('click', async e => {
+    if (e.touches && e.touches.length === 2) return;
+    const r = video.getBoundingClientRect();
+    const x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
+    if (track.applyConstraints && caps.header) {
+      try { await track.applyConstraints({ advanced: [{ focusMode: 'manual', pointsOfInterest: [{ x, y }] }] }); } catch {}
+    }
+  });
+  // 手电筒
+  let torchOn = false;
+  const torchBtn = layer.querySelector('#sc-torch');
+  if (torchBtn) torchBtn.onclick = async () => {
+    torchOn = !torchOn;
+    try { await track.applyConstraints({ advanced: [{ torch: torchOn }] }); torchBtn.style.background = torchOn ? 'rgba(255,255,255,.8)' : 'rgba(255,255,255,.12)'; torchBtn.style.color = torchOn ? '#000' : '#fff'; } catch {}
+  };
+  // 手动输入兜底
+  layer.querySelector('#sc-input').onclick = () => {
+    const v = prompt('手动输入：');
+    if (v) { settle(v.trim(), true); }
+  };
+  const close = () => { clearInterval(timer); stream.getTracks().forEach(t => t.stop()); layer.remove(); };
+  layer.querySelector('#sc-cancel').onclick = close;
+
+  // 识别器：白名单码制
+  let detector;
   try {
-    const fmts = await window.BarcodeDetector.getSupportedFormats();
-    detector = new window.BarcodeDetector({ formats: fmts.length ? fmts : ['code_128', 'code_39', 'ean_13', 'qr_code'] });
+    detector = new window.BarcodeDetector({ formats: ['code_128', 'code_39', 'ean_13', 'ean_8', 'qr_code', 'data_matrix', 'itf'] });
   } catch { detector = new window.BarcodeDetector(); }
 
-  const stop = () => {
-    clearInterval(timer);
-    stream.getTracks().forEach(t => t.stop());
-    layer.remove();
-  };
-  layer.querySelector('#scan-cancel').onclick = stop;
+  // 连续帧交叉验证：同一码值连续 3 帧识别到才采信（防误读）
+  const confirmed = {}; // value → 连续命中次数
+  let locked = false;   // 采信后短暂锁定，避免同一次多帧重复填入
+  let lockTimer = null;
+
+  async function settle(val, manual) {
+    if (locked) return;
+    // 内容白名单校验
+    if (type === 'loc' && !/^(AA|AB|AC|HC|DD|FX|BF|HX)-/i.test(val)) {
+      toast('这不是储位编码（应以 AA-/AB- 等开头）：' + val, true);
+      navigator.vibrate && navigator.vibrate([60, 60]);
+      return;
+    }
+    if (type === 'sku' && typeof SUPA_URL !== 'undefined') {
+      // 云端校验 SKU 是否存在（查无会提示，但不阻断——允许手动确认新 SKU）
+      try {
+        const r = await fetch(`${SUPA_URL}/rest/v1/finished_goods_stock?select=sku&sku=eq.${encodeURIComponent(val)}&limit=1`, { headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}` } });
+        if (r.ok) { const d = await r.json(); if (!d.length) { toast('⚠️ 系统中无此 SKU：' + val + '（请确认条码）', true); navigator.vibrate && navigator.vibrate([60, 60]); return; } }
+      } catch {}
+    }
+    locked = true;
+    close();
+    target.value = val;
+    target.dispatchEvent(new Event('input', { bubbles: true }));
+    target.dispatchEvent(new Event('change', { bubbles: true }));
+    navigator.vibrate && navigator.vibrate(30);
+    toast(manual ? '已手动输入' : '已识别：' + val);
+    // 关联查询按钮自动点
+    const wrap = target.parentElement;
+    const sib = wrap && wrap.querySelector('button');
+    if (sib && /search|查询|搜索/i.test(sib.textContent)) sib.click();
+    lockTimer = setTimeout(() => { locked = false; }, 1500);
+  }
 
   const timer = setInterval(async () => {
+    if (locked) return;
     try {
       const codes = await detector.detect(video);
-      if (codes && codes.length) {
-        const val = codes[0].rawValue;
-        if (val) {
-          stop();
-          target.value = val;
-          target.dispatchEvent(new Event('input', { bubbles: true }));
-          target.dispatchEvent(new Event('change', { bubbles: true }));
-          toast('已识别：' + val);
-          // 若输入框有关联的查询/搜索按钮，自动点
-          const sib = target.parentElement && target.parentElement.querySelector('button');
-          if (sib && /search|查询|搜索/i.test(sib.textContent)) sib.click();
-        }
+      if (!codes || !codes.length) {
+        // 帧无码 → 清零（必须连续帧才算）
+        if (!locked) for (const k in confirmed) if (Date.now() - confirmed[k].t > 700) delete confirmed[k];
+        return;
       }
-    } catch { /* 单帧识别失败忽略 */ }
-  }, 220);
+      const v = codes[0].rawValue;
+      if (!v) return;
+      const c = confirmed[v];
+      if (c) {
+        c.n++;
+        if (c.n >= 3) { settle(v, false); }  // 连续3帧确认 → 采信
+      } else {
+        confirmed[v] = { n: 1, t: Date.now() };
+      }
+    } catch {}
+  }, 180);
 }
 
 'use strict';
@@ -1065,7 +1153,7 @@ function renderMe(container) {
 async function renderConsumables(container) {
   container.innerHTML = navbar('耗材库存', true, `${isAdmin() ? '<button class="btn tiny primary" id="c-add">+ 新增</button>' : ''}<button class="btn tiny ghost" id="c-export">⬇️ 导出</button>`) + `
   <div class="page-body">
-    <div class="search-bar"><input class="inp" id="c-q" placeholder="搜索名称 / 编码 / 储位"><button class="btn ghost" onclick="scanCode('c-q')">📷</button><button class="btn primary" id="c-search">搜索</button></div>
+    <div class="search-bar"><input class="inp" id="c-q" placeholder="搜索名称 / 编码 / 储位"><button class="btn ghost" onclick="scanCode('c-q','code')">📷</button><button class="btn primary" id="c-search">搜索</button></div>
     <div id="c-stats"><div class="loading">加载中...</div></div>
     <div id="c-list"></div>
   </div>`;
@@ -1187,11 +1275,11 @@ async function renderStockIO(container, query) {
   const wrap = $('#io-form');
   wrap.innerHTML = `
     <div class="field"><label class="req">耗材 / 包材编码</label>
-      <div class="input-group"><span class="ig-ico">🔎</span><input id="io-code" placeholder="输入编码搜索"><button class="btn tiny ghost" onclick="scanCode('io-code')">📷</button><button class="btn tiny ghost" id="io-pick">搜索</button></div>
+      <div class="input-group"><span class="ig-ico">🔎</span><input id="io-code" placeholder="输入编码搜索"><button class="btn tiny ghost" onclick="scanCode('io-code','code')">📷</button><button class="btn tiny ghost" id="io-pick">搜索</button></div>
       <div id="io-picked" style="margin-top:8px"></div></div>
     <div class="field"><label class="req">${type === 'in' ? '入库' : '出库'}数量</label><input class="inp" id="io-qty" type="number" min="0.01" step="any"></div>
     <div class="field"><label>储位编码（引导前往核对）</label>
-      <div class="input-group"><span class="ig-ico">📍</span><input id="io-shelf" placeholder="储位编码"><button class="btn tiny ghost" onclick="scanCode('io-shelf')">📷</button></div></div>
+      <div class="input-group"><span class="ig-ico">📍</span><input id="io-shelf" placeholder="储位编码"><button class="btn tiny ghost" onclick="scanCode('io-shelf','loc')">📷</button></div></div>
     ${type === 'out' ? `
     <div class="field"><label>领用人</label><input class="inp" id="io-receiver" placeholder="领用人"></div>
     <div class="field"><label>用途/备注</label><textarea class="inp" id="io-reason" placeholder="用途/备注"></textarea></div>` : `
@@ -1264,7 +1352,7 @@ async function renderStockIO(container, query) {
 async function renderFGStock(container) {
   container.innerHTML = navbar('实物库存查询', true, `<button class="btn tiny ghost" id="fg-export">⬇️ 导出</button>`) + `
   <div class="page-body">
-    <div class="search-bar"><input class="inp" id="fg-q" placeholder="SKU / 储位号"><button class="btn ghost" onclick="scanCode('fg-q')">📷</button><button class="btn primary" id="fg-search">搜索</button></div>
+    <div class="search-bar"><input class="inp" id="fg-q" placeholder="SKU / 储位号"><button class="btn ghost" onclick="scanCode('fg-q','sku')">📷</button><button class="btn primary" id="fg-search">搜索</button></div>
     <div id="fg-stats"><div class="loading">加载中...</div></div>
     <div class="filter-row" id="fg-zone">
       <button class="chip active" data-v="">全部储区</button>
@@ -1385,13 +1473,13 @@ async function renderPutaway(container) {
       <div style="display:flex;gap:10px;align-items:flex-start;margin-bottom:14px">
         <div style="width:26px;height:26px;border-radius:50%;background:var(--primary);color:#fff;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;flex-shrink:0">1</div>
         <div style="flex:1"><div style="font-weight:700;margin-bottom:8px">扫描商品SKU条码</div>
-          <div class="input-group"><span class="ig-ico">📦</span><input id="pa-sku" placeholder="输入 SKU"><button class="btn tiny ghost" onclick="scanCode('pa-sku')">📷</button><button class="btn tiny primary" id="pa-query">查询</button></div>
+          <div class="input-group"><span class="ig-ico">📦</span><input id="pa-sku" placeholder="输入 SKU"><button class="btn tiny ghost" onclick="scanCode('pa-sku','sku')">📷</button><button class="btn tiny primary" id="pa-query">查询</button></div>
           <div id="pa-info" style="margin-top:8px"></div></div>
       </div>
       <div style="display:flex;gap:10px;align-items:flex-start;margin-bottom:14px">
         <div style="width:26px;height:26px;border-radius:50%;background:var(--primary);color:#fff;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;flex-shrink:0">3</div>
         <div style="flex:1"><div style="font-weight:700;margin-bottom:8px">扫描储位并提交</div>
-          <div class="input-group"><span class="ig-ico">📍</span><input id="pa-loc" placeholder="目标储位"><button class="btn tiny ghost" onclick="scanCode('pa-loc')">📷</button></div>
+          <div class="input-group"><span class="ig-ico">📍</span><input id="pa-loc" placeholder="目标储位"><button class="btn tiny ghost" onclick="scanCode('pa-loc','loc')">📷</button></div>
           <div id="pa-loctype" style="margin-top:6px;font-size:12px"></div>
           <div class="field" style="margin-top:10px"><label class="req">本次上架数量</label><input class="inp" id="pa-qty" type="number" min="1"></div>
           <button class="btn primary" id="pa-submit">提交上架</button></div>
@@ -1456,11 +1544,11 @@ async function renderFGPicking(container) {
   <div class="page-body">
     <div class="card">
       <div class="field"><label class="req">SKU</label>
-        <div class="input-group"><span class="ig-ico">📦</span><input id="pk-sku" placeholder="输入 SKU"><button class="btn tiny ghost" onclick="scanCode('pk-sku')">📷</button><button class="btn tiny primary" id="pk-query">查询</button></div></div>
+        <div class="input-group"><span class="ig-ico">📦</span><input id="pk-sku" placeholder="输入 SKU"><button class="btn tiny ghost" onclick="scanCode('pk-sku','sku')">📷</button><button class="btn tiny primary" id="pk-query">查询</button></div></div>
       <div id="pk-info" style="margin-bottom:12px"></div>
       <div class="field"><label class="req">出库数量</label><input class="inp" id="pk-qty" type="number" min="1"></div>
       <div class="field"><label class="req">出库储位</label>
-        <div class="input-group"><span class="ig-ico">📍</span><input id="pk-loc" placeholder="选择或输入储位"><button class="btn tiny ghost" onclick="scanCode('pk-loc')">📷</button></div>
+        <div class="input-group"><span class="ig-ico">📍</span><input id="pk-loc" placeholder="选择或输入储位"><button class="btn tiny ghost" onclick="scanCode('pk-loc','loc')">📷</button></div>
         <div id="pk-locs" style="margin-top:8px"></div></div>
       <div class="field"><label>性质</label>
         <select class="inp" id="pk-nature"><option value="不良品">不良品</option><option value="全新品">全新品</option></select></div>
@@ -1525,11 +1613,11 @@ async function renderTransfer(container) {
   <div class="page-body">
     <div class="card">
       <div class="field"><label class="req">SKU</label>
-        <div class="input-group"><span class="ig-ico">📦</span><input id="tr-sku" placeholder="输入 SKU"><button class="btn tiny ghost" onclick="scanCode('tr-sku')">📷</button><button class="btn tiny primary" id="tr-query">查询</button></div></div>
+        <div class="input-group"><span class="ig-ico">📦</span><input id="tr-sku" placeholder="输入 SKU"><button class="btn tiny ghost" onclick="scanCode('tr-sku','sku')">📷</button><button class="btn tiny primary" id="tr-query">查询</button></div></div>
       <div id="tr-info" style="margin-bottom:12px"></div>
       <div class="field"><label class="req">源储位</label>
         <div id="tr-from-list"></div></div>
-      <div class="field"><label class="req">目标储位</label><input class="inp" id="tr-to" placeholder="目标储位编码"><button class="btn tiny ghost" onclick="scanCode('tr-to')" style="margin-left:6px">📷</button></div>
+      <div class="field"><label class="req">目标储位</label><input class="inp" id="tr-to" placeholder="目标储位编码"><button class="btn tiny ghost" onclick="scanCode('tr-to','loc')" style="margin-left:6px">📷</button></div>
       <div class="field"><label class="req">移库数量</label><input class="inp" id="tr-qty" type="number" min="1"></div>
       <button class="btn primary" id="tr-submit">确认移库</button>
     </div>
@@ -2145,7 +2233,7 @@ async function renderFGInventory(container) {
     <div class="card">
       <div style="font-size:13px;color:var(--muted-foreground);margin-bottom:10px">逐件/批量盘点成品实物：录入实盘数量，自动计算差异，勾选"校准"将直接修正库存</div>
       <div class="field"><label class="req">SKU</label>
-        <div class="input-group"><span class="ig-ico">📦</span><input id="fi-sku" placeholder="输入 SKU"><button class="btn tiny ghost" onclick="scanCode('fi-sku')">📷</button><button class="btn tiny primary" id="fi-query">查询</button></div></div>
+        <div class="input-group"><span class="ig-ico">📦</span><input id="fi-sku" placeholder="输入 SKU"><button class="btn tiny ghost" onclick="scanCode('fi-sku','sku')">📷</button><button class="btn tiny primary" id="fi-query">查询</button></div></div>
       <div id="fi-info" style="margin-bottom:12px"></div>
       <div class="field"><label class="req">盘点储位</label><input class="inp" id="fi-loc" placeholder="储位编码"></div>
       <div class="field"><label class="req">实盘数量</label><input class="inp" id="fi-actual" type="number" placeholder="实盘数量"></div>
@@ -2196,7 +2284,7 @@ async function renderFGInventory(container) {
 async function renderConInventory(container) {
   container.innerHTML = navbar('包材库存盘点', true) + `
   <div class="page-body">
-    <div class="search-bar"><input class="inp" id="ci-q" placeholder="编码 / 储位"><button class="btn ghost" onclick="scanCode('ci-q')">📷</button><button class="btn primary" id="ci-search">搜索</button></div>
+    <div class="search-bar"><input class="inp" id="ci-q" placeholder="编码 / 储位"><button class="btn ghost" onclick="scanCode('ci-q','code')">📷</button><button class="btn primary" id="ci-search">搜索</button></div>
     <div id="ci-list"><div class="loading">加载中...</div></div>
   </div>`;
   const load = async () => {
