@@ -239,28 +239,32 @@ const SUPA_KEY = 'sb_publishable_Cl7vavkrpbV9yvGo9wLuCw_8JJzW8cO';
 const isCloud = () => localStorage.getItem('xiaoan_cloud') !== '0';
 
 /* PostgREST filter 智能编码：处理中文/空格/空值，避免 400
- * 支持顶层多条件 & 分隔、or=(a,b) 嵌套。空值条件（=eq. 结尾）自动剔除 */
+ * 输入格式约定（内部调用统一）：
+ *   单条件：col=op.value 例 sku=eq.A123 / name=ilike.*包材* / created_at=gte.2026-11-01
+ *   或嵌套：or=(col=op.v1,col2=op.v2)  多条件用 & 连接。空值（op.后为空）自动剔除
+ * 输出：每个 op.value 段编码 value（保留 * 通配符），顶层用 & 连接 */
 function encF(filter) {
   if (!filter) return '';
   const segs = filter.split('&').filter(s => s);
+  const encodeCond = (cond) => {
+    const m = cond.match(/^([a-zA-Z_][\w]*)=(not\.|ilike\.|like\.|eq\.|neq\.|gt\.|gte\.|lt\.|lte\.|in\.|is\.|)(.*)$/);
+    if (!m) return cond;
+    const col = m[1], op = m[2], val = m[3];
+    if (val === '') return null;
+    let enc;
+    if (op === 'in.') enc = val.split(',').map(v => encodeURIComponent(v)).join(',');
+    else enc = val.split('*').map(p => encodeURIComponent(p)).join('*');
+    return `${col}=${op}${enc}`;
+  };
   const out = [];
   for (const seg of segs) {
     if (seg.startsWith('or=(') && seg.endsWith(')')) {
-      const inner = seg.slice(4, -1);
-      const parts = inner.split(',').map(c => {
-        const m = c.match(/^([^(.]+)\.(not\.|ilike\.|like\.|eq\.|neq\.|gt\.|gte\.|lt\.|lte\.|in\.|is\.)(.*)$/);
-        if (m) return `${m[1]}.${m[2]}${encodeURIComponent(m[3])}`;
-        const m2 = c.match(/^([^(.]+)\.(.*)$/);
-        return m2 ? `${m2[1]}.${encodeURIComponent(m2[2])}` : c;
-      }).filter(c => !/\.(eq\.|in\.)$/.test(c)); // 剔除空值
+      const parts = seg.slice(4, -1).split(',').map(encodeCond).filter(c => c !== null);
       if (parts.length) out.push('or=(' + parts.join(',') + ')');
       continue;
     }
-    const m = seg.match(/^([^=]+)=(.*)$/);
-    if (!m) { out.push(seg); continue; }
-    const col = m[1], val = m[2];
-    if (val === 'eq.' || val === 'in.' || val === '') continue; // 空值条件剔除
-    out.push(`${col}=${encodeURIComponent(val)}`);
+    const c = encodeCond(seg);
+    if (c !== null) out.push(c);
   }
   return out.join('&');
 }
