@@ -238,17 +238,45 @@ const SUPA_URL = 'https://ianeqrdqowxxqicikrtv.supabase.co';
 const SUPA_KEY = 'sb_publishable_Cl7vavkrpbV9yvGo9wLuCw_8JJzW8cO';
 const isCloud = () => localStorage.getItem('xiaoan_cloud') !== '0';
 
+/* PostgREST filter 智能编码：处理中文/空格/空值，避免 400
+ * 支持顶层多条件 & 分隔、or=(a,b) 嵌套。空值条件（=eq. 结尾）自动剔除 */
+function encF(filter) {
+  if (!filter) return '';
+  const segs = filter.split('&').filter(s => s);
+  const out = [];
+  for (const seg of segs) {
+    if (seg.startsWith('or=(') && seg.endsWith(')')) {
+      const inner = seg.slice(4, -1);
+      const parts = inner.split(',').map(c => {
+        const m = c.match(/^([^(.]+)\.(not\.|ilike\.|like\.|eq\.|neq\.|gt\.|gte\.|lt\.|lte\.|in\.|is\.)(.*)$/);
+        if (m) return `${m[1]}.${m[2]}${encodeURIComponent(m[3])}`;
+        const m2 = c.match(/^([^(.]+)\.(.*)$/);
+        return m2 ? `${m2[1]}.${encodeURIComponent(m2[2])}` : c;
+      }).filter(c => !/\.(eq\.|in\.)$/.test(c)); // 剔除空值
+      if (parts.length) out.push('or=(' + parts.join(',') + ')');
+      continue;
+    }
+    const m = seg.match(/^([^=]+)=(.*)$/);
+    if (!m) { out.push(seg); continue; }
+    const col = m[1], val = m[2];
+    if (val === 'eq.' || val === 'in.' || val === '') continue; // 空值条件剔除
+    out.push(`${col}=${encodeURIComponent(val)}`);
+  }
+  return out.join('&');
+}
+
 /* Supabase REST 直连工具（云端模式专用） */
 const supa = {
   async rest(table, { select = '*', filter = '', order = '', limit = 0, single = false } = {}) {
     let url = `${SUPA_URL}/rest/v1/${table}?select=${encodeURIComponent(select)}`;
-    if (filter) url += '&' + filter;
+    const ef = encF(filter);
+    if (ef) url += '&' + ef;
     if (order) url += '&order=' + order;
     if (limit) url += '&limit=' + limit;
     const res = await fetch(url, { headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}` } });
     if (!res.ok) {
       const t = await res.text().catch(() => '');
-      throw new Error(`云端查询失败(${res.status})`);
+      throw new Error(`云端查询失败(${res.status}): ${t.slice(0, 80)}`);
     }
     const data = await res.json();
     return single ? (data[0] || null) : data;
@@ -640,10 +668,10 @@ async function renderHome(container) {
     if (isCloud()) {
       // 云端模式：并行查云端聚合出仪表盘数据
       const [cons, fg, todayInLogs, todayPick] = await Promise.all([
-        supa.rest('consumables', { select: 'stock,safety_stock' }),
-        supa.rest('finished_goods_stock', { select: 'ground_quantity,high_shelf_quantity,pick_quantity,new_quantity,system_stock' }),
-        supa.rest('putaway_operation_logs', { select: 'quantity', filter: `created_at=gte.${new Date(Date.now() - 864e5).toISOString()}` }),
-        supa.rest('finished_goods_picking_records', { select: 'quantity', filter: `created_at=gte.${new Date(Date.now() - 864e5).toISOString()}` }),
+        supa.rest('consumables', { select: 'stock,safety_stock', limit: 2000 }),
+        supa.rest('finished_goods_stock', { select: 'ground_quantity,high_shelf_quantity,pick_quantity,new_quantity,system_stock', limit: 5000 }),
+        supa.rest('putaway_operation_logs', { select: 'quantity', filter: `created_at=gte.${new Date(Date.now() - 864e5).toISOString()}`, limit: 5000 }),
+        supa.rest('finished_goods_picking_records', { select: 'quantity', filter: `created_at=gte.${new Date(Date.now() - 864e5).toISOString()}`, limit: 5000 }),
       ]);
       const sum = (a, k) => a.reduce((s, x) => s + (Number(x[k]) || 0), 0);
       d = {
@@ -1833,7 +1861,7 @@ async function renderRenoLabel(container) {
     try {
       let r;
       if (isCloud()) {
-        const list = await supa.rest('renovation_inventory', { select: 'id,sku,shelf_no,status,condition,quantity', filter: `(sku=ilike.*${q}*,shelf_no=ilike.*${q}*)&quantity=gt.0`, order: 'updated_at.desc', limit: 30 });
+        const list = await supa.rest('renovation_inventory', { select: 'id,sku,shelf_no,status,condition,quantity', filter: `or=(sku=ilike.*${q}*,shelf_no=ilike.*${q}*)&quantity=gt.0`, order: 'updated_at.desc', limit: 30 });
         r = { list };
       } else {
         r = await api('/reno-labels/search?q=' + encodeURIComponent(q));
@@ -2126,7 +2154,7 @@ async function renderRenoTransfer(container) {
     try {
       let list;
       if (isCloud()) {
-        list = await supa.rest('renovation_inventory', { select: 'id,sku,shelf_no,condition,quantity', filter: `(sku=ilike.*${q}*,shelf_no=ilike.*${q}*)`, order: 'updated_at.desc', limit: 100 });
+        list = await supa.rest('renovation_inventory', { select: 'id,sku,shelf_no,condition,quantity', filter: `or=(sku=ilike.*${q}*,shelf_no=ilike.*${q}*)`, order: 'updated_at.desc', limit: 100 });
       } else {
         const r = await api('/reno-putaway?q=' + encodeURIComponent(q));
         list = r.list;
