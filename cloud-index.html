@@ -498,6 +498,31 @@ function encF(filter) {
       if (parts.length) out.push('or=(' + parts.join(',') + ')');
       continue;
     }
+    if (seg.startsWith('and=(') && seg.endsWith(')')) {
+      const inner = seg.slice(5, -1);
+      const subs = [];
+      let buf = '', depth = 0;
+      for (const ch of inner) {
+        if (ch === '(') depth++;
+        if (ch === ')') depth--;
+        if (ch === ',' && depth === 0) { subs.push(buf); buf = ''; continue; }
+        buf += ch;
+      }
+      if (buf) subs.push(buf);
+      const okSubs = [];
+      for (const s of subs) {
+        if (s.startsWith('or=(') && s.endsWith(')')) {
+          const ps = s.slice(4, -1).split(',').map(encodeCond).filter(c => c !== null);
+          if (ps.length) okSubs.push('or=(' + ps.join(',') + ')');
+        } else {
+          const c = encodeCond(s);
+          if (c !== null) okSubs.push(c);
+        }
+      }
+      if (okSubs.length === 1) out.push(okSubs[0]);
+      else if (okSubs.length > 1) out.push('and=(' + okSubs.join(',') + ')');
+      continue;
+    }
     const c = encodeCond(seg);
     if (c !== null) out.push(c);
   }
@@ -996,6 +1021,7 @@ function renderAccordions(u) {
       { name: '翻新后库存查询', desc: '状态/成色筛选', href: '#/reno-inventory' },
       { name: '待翻新拣货', desc: '拣货任务/子任务进度', href: '#/reno-picking' },
       { name: '翻新主数据管理', desc: '分类/绑定/无需翻新', href: '#/reno-master' },
+      { name: '库存申请单', desc: '员工申请/管理员审批', href: '#/stock-apply' },
       { name: '翻新后出库匹配', desc: '匹配出库与扣减库存', href: '#/reno-outbound' },
       { name: '翻新后上架作业', desc: '扫码SKU上架到货架', href: '#/reno-putaway' },
       { name: '翻新后移库操作', desc: '翻新后储位间互相移库', href: '#/reno-transfer' },
@@ -1131,7 +1157,7 @@ function renderMe(container) {
     </div>
     <div class="card" style="padding:4px 14px">
       <a class="menu-item" href="#/change-password"><span class="m-ico">🔐</span><span class="m-text">账号安全</span><span class="m-arrow">›</span></a>
-      <div class="menu-item" style="cursor:default"><span class="m-ico">🔠</span><span class="m-text">字体大小（仅当前设备生效）</span><span class="m-arrow">›</span></div>
+      <a class="menu-item" href="#/font-setting"><span class="m-ico">🔠</span><span class="m-text">字体大小（仅当前设备生效）</span><span class="m-arrow">›</span></a>
     </div>
     <div class="card" style="padding:4px 14px;font-size:13px;color:var(--muted-foreground)">
       <div class="menu-item" style="cursor:default">隐私政策</div>
@@ -1393,7 +1419,7 @@ async function renderFGStock(container) {
         let filter = ors.length ? 'or=(' + ors.join(',') + ')' : '';
         if (zone) {
           const zf = `or=(ground_location=like.${zone}-*,high_shelf_location=like.${zone}-*,pick_location=like.${zone}-*)`;
-          filter = filter ? filter + '&' + zf : zf;
+          filter = filter ? 'and=(' + filter + ',' + zf + ')' : zf;
         }
         const list = await supa.rest('finished_goods_stock', { select: 'sku,system_stock,ground_location,ground_quantity,high_shelf_location,high_shelf_quantity,pick_location,pick_quantity,new_quantity', filter, order: 'sku', limit: 500 });
         // 高架明细：用 in= 批量查（最多 50 个一批），避免超长 or= 导致 400
@@ -1723,12 +1749,18 @@ async function renderRenoInventory(container) {
     <div class="filter-row" id="ri-status">
       <button class="chip active" data-v="">全部状态</button><button class="chip" data-v="翻新成功">翻新成功</button><button class="chip" data-v="翻新失败">翻新失败</button>
     </div>
+    <div class="filter-row" id="ri-cond">
+      <button class="chip active" data-v="">全部成色</button><button class="chip" data-v="九成新">九成新</button><button class="chip" data-v="九五新">九五新</button><button class="chip" data-v="全新品">全新品</button><button class="chip" data-v="八成新">八成新</button>
+    </div>
+    <div class="filter-row" id="ri-month">
+      <button class="chip active" data-v="">全部月份</button><button class="chip" data-v="2026-11">2026-11</button><button class="chip" data-v="2026-10">2026-10</button><button class="chip" data-v="2026-09">2026-09</button><button class="chip" data-v="2026-08">2026-08</button>
+    </div>
     <div class="filter-row" id="ri-stage">
       <button class="chip active" data-v="">全部阶段</button><button class="chip" data-v="搬仓前">搬仓前</button><button class="chip" data-v="搬仓后">搬仓后</button>
     </div>
     <div id="ri-list"><div class="loading">加载中...</div></div>
   </div>`;
-  let status = '', stage = '';
+  let status = '', stage = '', cond = '', month = '';
   const load = async () => {
     const listEl = $('#ri-list');
     listEl.innerHTML = '<div class="loading">加载中...</div>';
@@ -1738,13 +1770,18 @@ async function renderRenoInventory(container) {
       if (q) params.set('q', q);
       if (status) params.set('status', status);
       if (stage) params.set('stage', stage);
+      if (cond) params.set('condition', cond);
+      if (month) params.set('month', month);
       let r;
       if (isCloud()) {
         const q0 = trim($('#ri-q').value);
         const f = [];
-        if (q0) f.push(`(sku=ilike.*${q0}*,shelf_no=ilike.*${q0}*)`);
+        if (q0) f.push(`or=(sku=ilike.*${q0}*,shelf_no=ilike.*${q0}*)`);
         if (status) f.push(`status=eq.${status}`);
-        const list = await supa.rest('renovation_inventory', { select: 'id,sku,shelf_no,status,condition,quantity,stage,channel', filter: f.join('&'), order: 'updated_at.desc', limit: 200 });
+        if (cond) f.push(`condition=eq.${cond}`);
+        if (month) f.push(`belong_month=eq.${month}`);
+        if (stage) f.push(`stage=eq.${stage}`);
+        const list = await supa.rest('renovation_inventory', { select: 'id,sku,shelf_no,status,condition,quantity,stage,channel,belong_month', filter: f.join('&'), order: 'updated_at.desc', limit: 200 });
         r = { list };
       } else {
         r = await api('/renovation-inventory?' + params.toString());
@@ -1756,21 +1793,22 @@ async function renderRenoInventory(container) {
           <span style="display:flex;gap:5px;align-items:center">
             ${x.status === '翻新成功' ? '<span class="badge green">翻新成功</span>' : x.status === '翻新失败' ? '<span class="badge red">翻新失败</span>' : ''}
             <span style="font-size:13px;font-weight:700">${fmtQty(x.quantity)}</span></span></div>
-        <div class="li-row"><span>储位:<b>${esc(x.shelf_no || '-')}</b></span><span>成色:${esc(x.condition || '-')}</span></div>
-        <div class="li-row"><span>阶段:${esc(x.stage || '-')}</span><span>渠道:${esc(x.channel || '-')}</span>${x.belong_month ? `<span>归属:${esc(x.belong_month)}</span>` : ''}</div>
+        <div class="li-row"><span>储位:<b>${esc(x.shelf_no || '-')}</b></span><span>成色:<b>${esc(x.condition || '-')}</b></span></div>
+        <div class="li-row"><span>阶段:${esc(x.stage || '-')}</span><span>渠道:${esc(x.channel || '-')}</span></div>
+        ${x.belong_month ? `<div class="li-row"><span>所属月份:<b>${esc(x.belong_month)}</b></span></div>` : ''}
       </div>`).join('');
     } catch (e) { listEl.innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
   };
   $('#ri-search').onclick = load;
   $('#ri-q').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
-  $('#ri-status').querySelectorAll('.chip').forEach(ch => ch.onclick = () => {
-    status = ch.dataset.v;
-    $('#ri-status').querySelectorAll('.chip').forEach(x => x.classList.toggle('active', x === ch)); load();
+  const bindChips = (id, setter) => $(id).querySelectorAll('.chip').forEach(ch => ch.onclick = () => {
+    setter(ch.dataset.v);
+    $(id).querySelectorAll('.chip').forEach(x => x.classList.toggle('active', x === ch)); load();
   });
-  $('#ri-stage').querySelectorAll('.chip').forEach(ch => ch.onclick = () => {
-    stage = ch.dataset.v;
-    $('#ri-stage').querySelectorAll('.chip').forEach(x => x.classList.toggle('active', x === ch)); load();
-  });
+  bindChips('#ri-status', v => status = v);
+  bindChips('#ri-cond', v => cond = v);
+  bindChips('#ri-month', v => month = v);
+  bindChips('#ri-stage', v => stage = v);
   load();
 }
 
@@ -1796,9 +1834,10 @@ async function renderUnpackStats(container) {
     try {
       let r;
       if (isCloud()) {
-        const worker = $('#up-worker').value, fromDate = $('#up-from').value, toDate = $('#up-to').value;
+        const fromDate = $('#up-from').value, toDate = $('#up-to').value;
         const f = [];
-        if (worker) f.push(`worker_name=eq.${worker}`);
+        if (fromDate) f.push(`created_at=gte.${fromDate}`);
+        if (toDate) f.push(`created_at=lte.${toDate} 23:59:59`);
         if (fromDate) f.push(`created_at=gte.${fromDate}`);
         if (toDate) f.push(`created_at=lte.${toDate} 23:59:59`);
         const list = await supa.rest('unpacking_records', { select: 'worker_name,quantity,sku,created_at', filter: f.join('&'), limit: 1000 });
@@ -1964,10 +2003,20 @@ async function renderUsers(container) {
     try {
       let r;
       if (isCloud()) {
-        const list = await supa.rest('profiles', { select: 'id,username,role,status,permissions', order: 'username' });
-        r = { list: list.map(u => ({ ...u, permissions: Array.isArray(u.permissions) ? u.permissions : [] })) };
+        const list = await supa.rest('profiles', { select: 'id,username,role,status,permissions,inventory_mode_restriction,allow_daily_inventory_import', order: 'username' });
+        const users = list.map(u => ({ ...u, permissions: Array.isArray(u.permissions) ? u.permissions : (u.permissions ? [u.permissions] : []) }));
+        r = {
+          list: users,
+          summary: {
+            admin: users.filter(u => u.role === 'admin').length,
+            user: users.filter(u => u.role === 'user').length,
+            picker: users.filter(u => u.role === 'picker').length,
+            temp: users.filter(u => u.role === 'temp').length,
+          },
+        };
       } else {
         r = await api('/users');
+        if (!r.summary) r.summary = r.list.reduce((s, u) => { s[u.role] = (s[u.role] || 0) + 1; return s; }, {});
       }
       const s = r.summary;
       $('#u-body').innerHTML = `
@@ -2839,6 +2888,8 @@ async function route() {
       case '/change-password': await renderChangePassword(container); break;
       case '/reno-picking': await renderRenoPicking(container); break;
       case '/reno-master': await renderRenoMaster(container); break;
+      case '/font-setting': await renderFontSetting(container); break;
+      case '/stock-apply': await renderStockApply(container); break;
       case '/home-sort': await renderHomeSort(container); break;
       default:
         container.innerHTML = navbar('提示', true) + '<div class="page-body"><div class="empty"><span class="emoji">🚧</span>页面开发中</div></div>';
@@ -2921,6 +2972,133 @@ async function renderRenoMaster(container) {
 
 window.addEventListener('hashchange', route);
 route();
+
+/* ===== 库存申请单 ===== */
+async function renderStockApply(container) {
+  const STATUS = { pending: '<span class="badge" style="background:#fff7ed;color:#c2410c">待处理</span>', approved: '<span class="badge teal">已通过</span>', rejected: '<span class="badge red">已驳回</span>' };
+  container.innerHTML = navbar('库存申请单', true, `<button class="btn tiny primary" id="sa-add">+ 申请</button>`) + `
+  <div class="page-body">
+    <div class="filter-row" id="sa-filter">
+      <button class="chip active" data-v="">全部</button><button class="chip" data-v="pending">待处理</button><button class="chip" data-v="approved">已通过</button><button class="chip" data-v="rejected">已驳回</button>
+    </div>
+    <div id="sa-list"><div class="loading">加载中...</div></div>
+  </div>`;
+  let filt = '';
+  const u = getUser();
+  const load = async () => {
+    const listEl = $('#sa-list');
+    listEl.innerHTML = '<div class="loading">加载中...</div>';
+    try {
+      let list;
+      if (isCloud()) {
+        list = await supa.rest('stock_applications', { select: 'id,sku,qty,applicant,status,remark,created_at,handled_at,handler', filter: filt ? `status=eq.${filt}` : '', order: 'created_at.desc', limit: 200 });
+      } else {
+        const r = await api('/stock-apply' + (filt ? `?status=${filt}` : ''));
+        list = r.list;
+      }
+      if (!list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无申请</div>';
+      listEl.innerHTML = list.map(x => `
+      <div class="list-item">
+        <div class="li-head"><span class="li-name">${esc(x.sku)}</span>
+          <span style="display:flex;gap:5px;align-items:center">${STATUS[x.status] || ''}<span style="font-size:13px;font-weight:700">${fmtQty(x.qty)}</span></span></div>
+        <div class="li-row"><span>申请人:${esc(x.applicant || '-')}</span><span>${esc((x.created_at || '').replace('T', ' ').slice(0, 16))}</span></div>
+        ${x.remark ? `<div class="li-row"><span>备注:${esc(x.remark)}</span></div>` : ''}
+        ${x.status !== 'pending' && x.handler ? `<div class="li-row"><span>处理人:${esc(x.handler)} ${esc((x.handled_at || '').replace('T', ' ').slice(0, 16))}</span></div>` : ''}
+        ${x.status === 'pending' && isAdmin() ? `<div class="li-actions"><button class="btn tiny primary" data-ok="${x.id}">通过</button><button class="btn tiny danger" data-no="${x.id}">驳回</button></div>` : ''}
+      </div>`).join('');
+      listEl.querySelectorAll('[data-ok]').forEach(b => b.onclick = async () => { await handleApply(b.dataset.ok, 'approved'); load(); });
+      listEl.querySelectorAll('[data-no]').forEach(b => b.onclick = async () => { await handleApply(b.dataset.no, 'rejected'); load(); });
+    } catch (e) { listEl.innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
+  };
+  async function handleApply(id, status) {
+    try {
+      if (isCloud()) {
+        await supa.update('stock_applications', `id=eq.${id}`, { status, handled_at: new Date().toISOString(), handler: u?.username || '' });
+      } else { await api('/stock-apply/' + id, { method: 'PUT', body: { status } }); }
+      toast('已' + (status === 'approved' ? '通过' : '驳回'));
+    } catch (e) { toast(e.message, true); }
+  }
+  $('#sa-filter').querySelectorAll('.chip').forEach(ch => ch.onclick = () => {
+    filt = ch.dataset.v;
+    $('#sa-filter').querySelectorAll('.chip').forEach(x => x.classList.toggle('active', x === ch)); load();
+  });
+  $('#sa-add').onclick = () => {
+    const html = `<div style="padding:16px">
+      <div class="field"><label class="req">SKU</label><div class="input-group"><input id="sf-sku" placeholder="输入或扫 SKU"><button class="btn tiny ghost" onclick="scanCode('sf-sku','sku')">📷</button></div></div>
+      <div class="field"><label class="req">申请数量</label><input class="inp" id="sf-qty" type="number" min="1"></div>
+      <div class="field"><label>备注</label><input class="inp" id="sf-remark" placeholder="用途/说明"></div>
+      <button class="btn primary" id="sf-submit" style="width:100%">提交申请</button></div>`;
+    const dlg = el('div', 'modal-mask');
+    dlg.innerHTML = `<div class="modal" style="max-width:420px;margin:auto;...">${navbar('提交库存申请', true)}${html}</div>`;
+    dlg.style.cssText = 'position:fixed;inset:0;z-index:999;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center';
+    const box = el('div');
+    box.style.cssText = 'background:#fff;border-radius:16px;max-width:440px;width:88%;padding:0 0 14px';
+    box.innerHTML = navbar('提交库存申请', true) + html;
+    dlg.innerHTML = ''; dlg.appendChild(box);
+    document.body.appendChild(dlg);
+    box.querySelector('.back').onclick = () => dlg.remove();
+    box.querySelector('#sf-submit').onclick = async () => {
+      const sku = trim(box.querySelector('#sf-sku').value), qty = Number(box.querySelector('#sf-qty').value);
+      const remark = trim(box.querySelector('#sf-remark').value);
+      if (!sku || qty <= 0) return toast('SKU 和数量必填', true);
+      try {
+        if (isCloud()) {
+          await supa.insert('stock_applications', { sku, qty, applicant: u?.username || '', status: 'pending', remark, created_by: u?.id || null });
+        } else { await api('/stock-apply', { method: 'POST', body: { sku, qty, remark } }); }
+        supa.invalidate();
+        toast('申请已提交');
+        dlg.remove(); load();
+      } catch (e) { toast(e.message, true); }
+    };
+  };
+  load();
+}
+
+/* ===== 字体大小设置（仅本机本视角生效）===== */
+function applyFontScale() {
+  const s = Number(localStorage.getItem('xiaoan_font_scale') || 1);
+  const map = { 1: '14px', 1.15: '16px', 1.3: '18px', 1.5: '21px' };
+  document.documentElement.style.fontSize = map[s] || '14px';
+}
+applyFontScale();
+async function renderFontSetting(container) {
+  const cur = Number(localStorage.getItem('xiaoan_font_scale') || 1);
+  const opts = [
+    { v: 1, label: '标准', sub: '默认大小' },
+    { v: 1.15, label: '中号', sub: '稍大，适合日常' },
+    { v: 1.3, label: '大号', sub: '适合远距离/光线不足' },
+    { v: 1.5, label: '特大号', sub: '最大字号' },
+  ];
+  container.innerHTML = navbar('字体大小', true) + `
+  <div class="page-body">
+    <div class="card" style="padding:4px 0">
+      ${opts.map(o => `
+      <div class="menu-item" data-v="${o.v}" style="cursor:pointer;padding:12px 16px;${Number(o.v) === cur ? 'background:var(--primary-soft)' : ''}">
+        <span style="flex:1">
+          <div style="font-size:${14 * o.v}px;font-weight:${Number(o.v) === cur ? 700 : 500}">${o.label}</div>
+          <div style="font-size:11px;color:var(--muted-foreground)">${o.sub}</div>
+        </span>
+        ${Number(o.v) === cur ? '<span style="color:var(--primary);font-size:18px">✓</span>' : '<span class="m-arrow">›</span>'}
+      </div>`).join('')}
+    </div>
+    <div style="font-size:12px;color:var(--muted-foreground);margin-top:12px;line-height:1.6;padding:0 4px">
+      字号设置仅对<b>当前设备</b>生效，不影响其他员工。选完立即生效。
+    </div>
+    <div style="margin-top:14px;padding:14px;background:var(--background);border-radius:12px">
+      <div style="font-size:12px;color:var(--muted);margin-bottom:8px">预览：</div>
+      <div class="list-item" style="margin:0">
+        <div class="li-head"><span class="li-name">A121D621</span><span class="badge teal">样品</span></div>
+        <div class="li-row"><span>系统库存:<b>1,364</b></span><span>实物:<b>1,569</b></span></div>
+      </div>
+    </div>
+  </div>`;
+  container.querySelectorAll('[data-v]').forEach(el => el.onclick = () => {
+    localStorage.setItem('xiaoan_font_scale', el.dataset.v);
+    applyFontScale();
+    renderFontSetting(container);
+  });
+}
+
 
 </script>
 
