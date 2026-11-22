@@ -59,6 +59,7 @@ ul,li{list-style:none}
 .badge.purple{background:var(--purple-soft);color:var(--purple)}
 .badge.teal{background:var(--teal-soft);color:var(--teal)}
 .badge.gray{background:#f1f3f9;color:var(--muted-foreground)}
+.badge.blue{background:#eff6ff;color:#1d4ed8}
 
 /* 卡片 */
 .card{background:var(--card);border-radius:var(--radius-l);padding:14px;margin-bottom:12px;box-shadow:0 1px 3px rgba(15,23,42,.04)}
@@ -303,7 +304,14 @@ async function scanCode(targetId, type) {
 
   // 引擎：原生优先，否则 ZXing
   let useNative = 'BarcodeDetector' in window;
-  let zxReader = null;
+  let detector = null, zxReader = null;
+  if (useNative) {
+    try {
+      detector = new BarcodeDetector({
+        formats: ['code_128', 'code_39', 'ean_13', 'ean_8', 'itf', 'qr_code'],
+      });
+    } catch { useNative = false; }
+  }
   if (!useNative) {
     try { const Z = await loadZXing(); zxReader = new Z.BrowserMultiFormatReader(undefined, { delayBetweenScanAttempts: 150 }); }
     catch { return toast('扫码组件加载失败（请检查网络），可手动输入', true); }
@@ -754,11 +762,11 @@ const cloudWrite = {
     const srcQty = st === 'ground' ? Number(fg.ground_quantity) : st === 'high' ? Number(fg.high_shelf_quantity) : Number(fg.pick_quantity);
     if (srcQty < qty) throw new Error(`源储位数量不足（当前 ${srcQty}）`);
     const now = this._now();
+    // 先扣源储位量（目标储位量在下方按目标类型单独处理，避免双重 update 冲突）
     const patch = {}; patch.updated_at = now;
     if (st === 'ground') patch.ground_quantity = srcQty - qty;
     else if (st === 'high') patch.high_shelf_quantity = srcQty - qty;
     else patch.pick_quantity = srcQty - qty;
-    if (tt === 'ground') { patch.ground_location = to; patch.ground_quantity = (Number(fg.ground_quantity) || 0) + (st === 'ground' ? 0 : 0) + (st === 'ground' ? -qty : 0) + qty; if (st === 'ground') patch.ground_quantity = srcQty - qty + qty; }
     await supa.update('finished_goods_stock', `sku=eq.${sku}`, patch);
     // 高架位移出扣明细
     if (st === 'high') {
@@ -874,6 +882,40 @@ const cloudWrite = {
     const now = this._now();
     await supa.insert('physical_inventory_check_records', { id: this._uid(), sku, location, actual_qty: actualQty, mode: 'spot', status: apply ? 'applied' : 'pending', created_by: getUser()?.id || null, created_at: now });
     await this._log('实物库存盘点', sku, `盘点 ${sku}@${location} 实盘 ${actualQty}件${apply ? '（已应用）' : ''}`);
+    return { ok: true };
+  },
+  /* 耗材新增 / 编辑（管理员）*/
+  async upsertConsumable(body, id) {
+    const now = this._now();
+    if (id) {
+      const patch = {
+        name: body.name, material_name: body.material_name || '', category: body.category,
+        unit: body.unit, stock: Number(body.stock) || 0, shelf_code: body.shelf_code || '',
+        safety_stock: Number(body.safety_stock) || 0, moq: Number(body.moq) || 0, updated_at: now,
+      };
+      await supa.update('consumables', `id=eq.${id}`, patch);
+      // 同步 consumable_inventory（以 name 作 code 关联）
+      if (patch.name) {
+        const ci = await supa.rest('consumable_inventory', { select: 'id', filter: `code=eq.${patch.name}`, single: true });
+        if (ci) await supa.update('consumable_inventory', `id=eq.${ci.id}`, { name: patch.material_name, stock: patch.stock, updated_at: now });
+      }
+      await this._log('耗材管理', patch.name, `更新耗材：${patch.name}`);
+    } else {
+      await supa.insert('consumables', {
+        id: this._uid(), name: body.name, material_name: body.material_name || '', category: body.category,
+        unit: body.unit, stock: Number(body.stock) || 0, shelf_code: body.shelf_code || '',
+        safety_stock: Number(body.safety_stock) || 0, moq: Number(body.moq) || 0,
+        created_by: getUser()?.id || null, created_at: now, updated_at: now,
+      });
+      await this._log('耗材管理', body.name, `新增耗材：${body.name}`);
+    }
+    return { ok: true };
+  },
+  /* 耗材删除（管理员）*/
+  async deleteConsumable(id) {
+    const c = await supa.rest('consumables', { select: 'id,name', filter: `id=eq.${id}`, single: true });
+    await fetch(`${SUPA_URL}/rest/v1/consumables?id=eq.${id}`, { method: 'DELETE', headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}` } });
+    await this._log('耗材管理', c?.name || null, `删除耗材：${c?.name || id}`);
     return { ok: true };
   },
   /* 包材盘点 */
@@ -1117,7 +1159,7 @@ function recommendPickPlan(qty, fg, highs, restricts) {
   return remain > 0 ? { plan, short: remain } : { plan, short: 0 };
 }
 
-/* 常用功能宫格：按使用频率推荐（localStorage 计数） */
+/* 常用功能宫格：自定义排序优先 → 点击频率推荐 → 默认序 */
 const ALL_GRIDS = [
   { href: '#/fg-stock', ico: '🔎', cls: 'var(--teal-soft)', name: '实物库存查询', desc: '成品SKU/PN/储位', dft: 1 },
   { href: '#/putaway', ico: '📥', cls: 'var(--green-soft)', name: '上架作业', desc: '成品入库上架推荐', dft: 2 },
@@ -1132,6 +1174,7 @@ const ALL_GRIDS = [
   { href: '#/records', ico: '🗂️', cls: 'var(--primary-soft)', name: '记录查询', desc: '近2万条操作日志', dft: 11 },
   { href: '#/stock-gap', ico: '⚠️', cls: 'var(--orange-soft)', name: '账实差异提醒', desc: '系统数vs实物数', dft: 12 },
 ];
+const HOME_ORDER_KEY = 'xiaoan_home_order_v1';
 function trackGridClick(href) {
   try {
     const m = JSON.parse(localStorage.getItem('xiaoan_grid_cnt') || '{}');
@@ -1140,12 +1183,27 @@ function trackGridClick(href) {
   } catch {}
 }
 function renderHomeGrid() {
+  let customOrder = null; try { customOrder = JSON.parse(localStorage.getItem(HOME_ORDER_KEY) || 'null'); } catch {}
   let cnt = {}; try { cnt = JSON.parse(localStorage.getItem('xiaoan_grid_cnt') || '{}'); } catch {}
-  const sorted = ALL_GRIDS.slice().sort((a, b) => {
-    const ca = cnt[a.href] || 0, cb = cnt[b.href] || 0;
-    if (ca !== cb) return cb - ca;        // 点击多的在前
-    return a.dft - b.dft;                  // 无点击按默认序
-  }).slice(0, 3);
+  let sorted;
+  if (customOrder && customOrder.length) {
+    // 有自定义排序：按用户排序顺序取前 3 个仍存在的功能
+    const gridOf = Object.fromEntries(ALL_GRIDS.map(g => [g.href, g]));
+    sorted = customOrder.map(h => gridOf[h]).filter(Boolean).slice(0, 3);
+    // 不足 3 个时用默认序补齐
+    if (sorted.length < 3) {
+      for (const g of ALL_GRIDS.slice().sort((a, b) => a.dft - b.dft)) {
+        if (sorted.length >= 3) break;
+        if (!sorted.includes(g)) sorted.push(g);
+      }
+    }
+  } else {
+    sorted = ALL_GRIDS.slice().sort((a, b) => {
+      const ca = cnt[a.href] || 0, cb = cnt[b.href] || 0;
+      if (ca !== cb) return cb - ca;        // 点击多的在前
+      return a.dft - b.dft;                  // 无点击按默认序
+    }).slice(0, 3);
+  }
   return sorted.map(g => `<a class="g-item" href="${g.href}" onclick="trackGridClick('${g.href}')"><span class="g-ico" style="background:${g.cls}">${g.ico}</span><span class="g-name">${esc(g.name)}</span><span class="g-desc">${esc(g.desc)}</span></a>`).join('');
 }
 
@@ -1391,7 +1449,11 @@ async function renderConsumables(container) {
           if (act === 'edit') return consumableForm(c, load);
           if (act === 'del') {
             if (!(await confirmBox(`确定删除「${c.name}」？`, true))) return;
-            try { await api(`/consumables/${id}`, { method: 'DELETE' }); toast('已删除'); load(); }
+            try {
+              if (isCloud()) await cloudWrite.deleteConsumable(id);
+              else await api(`/consumables/${id}`, { method: 'DELETE' });
+              toast('已删除'); load();
+            }
             catch (e) { toast(e.message, true); }
           }
         });
@@ -1428,7 +1490,8 @@ function consumableForm(c, onDone) {
     };
     if (!body.name) return toast('包材编码不能为空', true);
     try {
-      await api('/consumables' + (isEdit ? `/${c.id}` : ''), { method: isEdit ? 'PUT' : 'POST', body });
+      if (isCloud()) await cloudWrite.upsertConsumable(body, isEdit ? c.id : null);
+      else await api('/consumables' + (isEdit ? `/${c.id}` : ''), { method: isEdit ? 'PUT' : 'POST', body });
       toast(isEdit ? '已更新' : '新增成功'); mask.remove(); onDone && onDone();
     } catch (e) { toast(e.message, true); }
   };
@@ -1494,8 +1557,9 @@ async function renderStockIO(container, query) {
   // 带参直接选定
   if (query.id) {
     try {
-      const r = await api('/consumables');
-      const c = r.list.find(x => x.id === query.id);
+      let c = null;
+      if (isCloud()) c = await supa.rest('consumables', { select: 'id,name,stock,safety_stock,unit,shelf_code,material_name', filter: `id=eq.${query.id}`, single: true });
+      else { const r = await api('/consumables'); c = r.list.find(x => x.id === query.id) || null; }
       if (c) { picked = c; $('#io-code').value = c.name; $('#io-shelf').value = c.shelf_code || '';
         $('#io-picked').innerHTML = `<div style="background:var(--primary-soft);padding:8px 10px;border-radius:10px;font-size:13px">✅ 已选：<b>${esc(c.name)}</b>（库存 ${fmtQty(c.stock)} ${esc(c.unit)}）</div>`; }
     } catch {}
@@ -2667,17 +2731,36 @@ async function renderRenoLabel(container) {
         n.style.borderColor = 'var(--primary)';
         const it = picked;
         $('#rl-preview').innerHTML = `
-        <div class="card" style="border:2px solid #334155">
-          <div style="display:flex;justify-content:space-between;margin-bottom:6px">
-            <span style="font-weight:800;font-size:18px">${esc(it.sku)}</span>
-            <span class="badge green">${esc(it.status || '翻新成功')}</span></div>
-          <div style="font-size:12px;color:var(--muted-foreground);margin-bottom:4px">渠道：${esc(it.channel || '-')} · 成色：${esc(it.condition || '-')}</div>
-          <div style="font-family:monospace;font-size:22px;font-weight:800;background:#f8fafc;padding:6px 8px;border-radius:6px">${esc(it.shelf_no)}</div>
-          <div style="display:flex;gap:2px;margin-top:5px;height:46px;overflow:hidden">
-            ${Array.from({length: Math.min(it.shelf_no.replace(/-/g,'').length, 24)}, (_, i) => `<div style="width:${2 + ((i * 7) % 4)}px;background:#000;height:100%"></div>`).join('')}
+        <div class="reno-label-sheet">
+          <div class="reno-label-print" style="border:2px solid #334155;border-radius:10px;padding:10px">
+            <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+              <span style="font-weight:800;font-size:18px">${esc(it.sku)}</span>
+              <span class="badge green">${esc(it.status || '翻新成功')}</span></div>
+            <div style="font-size:12px;color:var(--muted-foreground);margin-bottom:6px">渠道：${esc(it.channel || '-')} · 成色：${esc(it.condition || '-')}</div>
+            <div style="text-align:center;margin-bottom:6px"><img src="${code128DataURL(it.sku, { height: 44, moduleWidth: 2 })}" alt="SKU条码" style="max-width:100%"></div>
+            <div style="font-family:monospace;font-size:22px;font-weight:800;background:#f8fafc;padding:6px 8px;border-radius:6px">${esc(it.shelf_no)}</div>
+            <div style="text-align:center;margin-top:6px"><img src="${code128DataURL(it.shelf_no, { height: 40, moduleWidth: 2, showText: true })}" alt="${esc(it.shelf_no)}条码" style="max-width:100%"></div>
           </div>
-          <button class="btn primary" style="margin-top:12px" onclick="window.print()">🖨️ 打印标签</button>
+          <button class="btn primary" style="margin-top:12px" id="rl-print">🖨️ 打印标签</button>
         </div>`;
+        $('#rl-print').onclick = () => {
+          const node = $('#rl-preview .reno-label-sheet').cloneNode(true);
+          const holder = document.createElement('div');
+          holder.style.cssText = 'position:fixed;left:0;top:0;width:100%;z-index:9998';
+          node.querySelector('#rl-print')?.remove();
+          holder.appendChild(node);
+          document.body.appendChild(holder);
+          const st = document.createElement('style');
+          st.textContent = '@media print{' +
+            '@page{size:100mm 150mm;margin:0}' +
+            'body *{visibility:hidden}' +
+            '.reno-label-sheet,.reno-label-sheet *{visibility:visible}' +
+            '.reno-label-sheet{position:absolute;left:0;top:0;width:100mm;height:150mm;box-sizing:border-box;padding:3mm;border:none;background:#fff}' +
+            '.reno-label-print{border:1px solid #000!important;border-radius:0;padding:8mm 6mm}}';
+          document.head.appendChild(st);
+          window.print();
+          setTimeout(() => { document.body.removeChild(holder); document.head.removeChild(st); }, 500);
+        };
       });
     } catch (e) { toast(e.message, true); }
   };
@@ -2748,11 +2831,18 @@ async function renderFGInventory(container) {
     const sku = trim($('#fi-sku').value);
     if (!sku) return toast('请输入 SKU', true);
     try {
-      const r = await api('/finished-goods?q=' + encodeURIComponent(sku));
-      fg = r.list.find(x => x.sku === sku) || null;
+      let fg0 = null, highs = [];
+      if (isCloud()) {
+        fg0 = await supa.rest('finished_goods_stock', { select: '*', filter: `sku=eq.${sku}`, single: true });
+        if (fg0) highs = await supa.rest('finished_goods_stock_high_shelves', { select: 'location,quantity', filter: `sku=eq.${sku}`, order: 'created_at' });
+      } else {
+        const r = await api('/finished-goods?q=' + encodeURIComponent(sku));
+        fg0 = r.list.find(x => x.sku === sku) || null;
+        highs = r.highMap[sku] || [];
+      }
+      fg = fg0;
       const info = $('#fi-info');
       if (!fg) { info.innerHTML = '<div style="color:var(--red);font-size:13px">❌ SKU 不存在</div>'; return; }
-      const highs = r.highMap[sku] || [];
       const locs = [];
       if (fg.ground_quantity > 0 && fg.ground_location) locs.push(`${fg.ground_location}（地堆 ${fg.ground_quantity}）`);
       highs.forEach(h => locs.push(`${h.location}（高架 ${h.quantity}）`));
@@ -2899,8 +2989,10 @@ async function renderRenoPutaway(container) {
   <div class="page-body">
     <div class="card">
       <div style="font-size:13px;color:var(--muted-foreground);margin-bottom:10px">扫码/输入 SKU 上架到货架，登记翻新结果与成色</div>
-      <div class="field"><label class="req">SKU</label><input class="inp" id="rp-sku" placeholder="SKU"></div>
-      <div class="field"><label class="req">储位号</label><input class="inp" id="rp-shelf" placeholder="如 FX-01-05-001"></div>
+      <div class="field"><label class="req">SKU</label>
+        <div class="input-group"><span class="ig-ico">📦</span><input id="rp-sku" placeholder="扫或输 SKU"><button class="btn tiny ghost" onclick="scanCode('rp-sku','sku')">📷</button></div></div>
+      <div class="field"><label class="req">储位号</label>
+        <div class="input-group"><span class="ig-ico">📍</span><input id="rp-shelf" placeholder="如 FX-01-05-001"><button class="btn tiny ghost" onclick="scanCode('rp-shelf','loc')">📷</button></div></div>
       <div class="field"><label class="req">数量</label><input class="inp" id="rp-qty" type="number" min="1"></div>
       <div class="field"><label class="req">翻新结果</label>
         <select class="inp" id="rp-status"><option>翻新成功</option><option>翻新失败</option></select></div>
@@ -3038,12 +3130,21 @@ async function renderUsageRank(container) {
   try {
     let r;
     if (isCloud()) {
-      const recs = await supa.rest('stock_records', { select: 'consumable_id,quantity', filter: 'type=eq.out', limit: 2000 });
-      const cons = await supa.rest('consumables', { select: 'id,name' });
-      const nameOf = Object.fromEntries(cons.map(c => [c.id, c.name]));
+      const [recs, cons] = await Promise.all([
+        supa.rest('stock_records', { select: 'consumable_id,quantity,type', limit: 5000 }),
+        supa.rest('consumables', { select: 'id,name,material_name' }),
+      ]);
+      const infoOf = Object.fromEntries(cons.map(c => [c.id, c]));
       const agg = {};
-      recs.forEach(x => { const n = nameOf[x.consumable_id] || x.consumable_id; agg[n] = (agg[n] || 0) + Number(x.quantity || 0); });
-      const list = Object.entries(agg).map(([name, quantity]) => ({ name, quantity })).sort((a, b) => b.quantity - a.quantity).slice(0, 50);
+      recs.forEach(x => {
+        const key = x.consumable_id;
+        if (!agg[key]) agg[key] = { name: infoOf[x.consumable_id]?.name || '(已删除)', material_name: infoOf[x.consumable_id]?.material_name || '', outQty: 0, inQty: 0, cnt: 0 };
+        const a = agg[key];
+        if (x.type === 'out') a.outQty += Number(x.quantity || 0);
+        else a.inQty += Number(x.quantity || 0);
+        a.cnt++;
+      });
+      const list = Object.values(agg).sort((a, b) => b.outQty - a.outQty).slice(0, 50);
       r = { list };
     } else {
       r = await api('/usage-rank');
@@ -3118,8 +3219,17 @@ async function renderDistrStats(container) {
     let r;
     if (isCloud()) {
       const mappings = await supa.rest('picking_mappings', { select: 'sku,channel,location', limit: 1000 });
-      const channels = {}; mappings.forEach(m => { channels[m.channel] = (channels[m.channel] || 0) + 1; });
-      r = { totalMappings: mappings.length, channels: Object.entries(channels).map(([channel, count]) => ({ channel, count })).sort((a, b) => b.count - a.count), recent: [] };
+      const channels = {}, zones = {};
+      mappings.forEach(m => {
+        channels[m.channel] = (channels[m.channel] || 0) + 1;
+        const zone = (m.location || '-').split('-')[0] || '-';
+        zones[zone] = (zones[zone] || 0) + 1;
+      });
+      r = {
+        total: mappings.length,
+        byChannel: Object.entries(channels).map(([channel, cnt]) => ({ channel, cnt })).sort((a, b) => b.cnt - a.cnt),
+        byZone: Object.entries(zones).map(([zone, cnt]) => ({ zone, cnt })).sort((a, b) => b.cnt - a.cnt),
+      };
     } else {
       r = await api('/distr-stats');
     }
@@ -3169,28 +3279,27 @@ async function renderChangePassword(container) {
 
 /* ===== 首页排序 ===== */
 async function renderHomeSort(container) {
-  const u = getUser();
-  const KEY = 'xiaoan_home_order_v1';
-  const DEFAULT = [
-    { name: '实物库存查询', href: '#/fg-stock', ico: '🔎' },
-    { name: '上架作业', href: '#/putaway', ico: '📥' },
-    { name: '箱唛标签打印', href: '#/box-label', ico: '🖨️' },
-    { name: '耗材列表', href: '#/consumables', ico: '📦' },
-    { name: '入库登记', href: '#/stock-io?type=in', ico: '⬇️' },
-    { name: '出库登记', href: '#/stock-io?type=out', ico: '⬆️' },
-    { name: '记录查询', href: '#/records', ico: '📋' },
-    { name: '拆包统计', href: '#/unpack-stats', ico: '✂️' },
-  ];
+  const KEY = HOME_ORDER_KEY;
+  const DEFAULT = ALL_GRIDS.slice().sort((a, b) => a.dft - b.dft);
   let order = DEFAULT;
-  try { order = JSON.parse(localStorage.getItem(KEY)) || DEFAULT; } catch {}
+  try {
+    const saved = JSON.parse(localStorage.getItem(KEY) || 'null');
+    if (saved && saved.length) {
+      // 以保存的顺序为主，剔除已下线的入口，补上新增的入口
+      const known = new Set(saved);
+      const merged = saved.filter(h => DEFAULT.some(d => d.href === h));
+      DEFAULT.forEach(d => { if (!known.has(d.href)) merged.push(d.href); });
+      if (merged.length) order = merged.map(h => DEFAULT.find(d => d.href === h)).filter(Boolean);
+    }
+  } catch {}
   const render = () => {
     container.innerHTML = navbar('常用功能排序', true, `<button class="btn tiny ghost" id="hs-reset">重置</button>`) + `
     <div class="page-body">
-      <div style="font-size:12px;color:var(--muted-foreground);margin-bottom:10px">点击上下箭头调整常用功能宫格顺序（仅当前设备生效）</div>
+      <div style="font-size:12px;color:var(--muted-foreground);margin-bottom:10px">调整顺序后，首页宫格按<b>前 3 项</b>展示（自动接管原"按使用频率推荐"）。仅当前设备生效。</div>
       ${order.map((it, i) => `
       <div class="list-item" style="display:flex;align-items:center;gap:10px">
         <span style="font-size:20px;width:30px;text-align:center">${it.ico}</span>
-        <span style="flex:1;font-weight:600">${esc(it.name)}</span>
+        <span style="flex:1;font-weight:600">${esc(it.name)}${i < 3 ? ' <span style="font-size:11px;color:var(--primary)">·首页展示</span>' : ''}</span>
         <button class="btn tiny ghost" data-act="up" data-i="${i}" ${i === 0 ? 'disabled' : ''}>↑</button>
         <button class="btn tiny ghost" data-act="down" data-i="${i}" ${i === order.length - 1 ? 'disabled' : ''}>↓</button>
       </div>`).join('')}
@@ -3202,7 +3311,7 @@ async function renderHomeSort(container) {
       if (b.dataset.act === 'down' && i < order.length - 1) { [order[i + 1], order[i]] = [order[i], order[i + 1]]; }
       render();
     });
-    $('#hs-save').onclick = () => { localStorage.setItem(KEY, JSON.stringify(order)); toast('✅ 已保存，返回首页生效'); location.hash = '#/'; };
+    $('#hs-save').onclick = () => { localStorage.setItem(KEY, JSON.stringify(order.map(o => o.href))); toast('✅ 已保存，返回首页生效'); location.hash = '#/'; };
     $('#hs-reset').onclick = () => { order = [...DEFAULT]; render(); };
   };
   render();
@@ -3380,13 +3489,13 @@ async function route() {
 /* ===== 待翻新拣货（任务列表 + 子任务明细）===== */
 async function renderRenoPicking(container) {
   const detailId = new URLSearchParams(location.hash.split('?')[1] || '').get('task');
-  container.innerHTML = navbar('待翻新拣货', true) + `<div class="page-body has-tab"><div id="pk-tasks"><div class="loading">加载中...</div></div></div>`;
+  container.innerHTML = navbar('待翻新拣货', true) + `<div class="page-body"><div id="pk-tasks"><div class="loading">加载中...</div></div></div>`;
   if (isCloud()) {
-    const el = $('#pk-tasks');
+    const listBox = $('#pk-tasks');
     if (detailId) {
       // 子任务明细
       const subs = await supa.rest('refurbish_picking_subtasks', { select: 'subtask_no,sku,category,plan_quantity,picked_quantity,status,assigned_to,last_picked_location', filter: `task_id=eq.${detailId}`, order: 'subtask_no', limit: 500 });
-      el.innerHTML = `<div style="margin-bottom:10px"><a href="#/reno-picking" style="color:var(--primary);font-size:13px">‹ 返回任务列表</a></div>` +
+      listBox.innerHTML = `<div style="margin-bottom:10px"><a href="#/reno-picking" style="color:var(--primary);font-size:13px">‹ 返回任务列表</a></div>` +
         (subs.length ? subs.map(s => {
           const done = s.status === 'completed';
           const pct = Number(s.plan_quantity) ? Math.round(Number(s.picked_quantity) / Number(s.plan_quantity) * 100) : 0;
@@ -3402,7 +3511,7 @@ async function renderRenoPicking(container) {
     }
     // 任务列表
     const tasks = await supa.rest('refurbish_picking_tasks', { select: 'id,task_no,title,total_skus,total_quantity,picked_quantity,status,created_at', order: 'created_at.desc', limit: 100 });
-    el.innerHTML = tasks.length ? tasks.map(t => {
+    listBox.innerHTML = tasks.length ? tasks.map(t => {
       const done = t.status === 'completed';
       const pct = Number(t.total_quantity) ? Math.round(Number(t.picked_quantity) / Number(t.total_quantity) * 100) : 0;
       return `<div class="list-item" style="cursor:pointer" onclick="location.hash='#/reno-picking?task=${encodeURIComponent(t.id)}'">
@@ -3423,7 +3532,7 @@ async function renderRenoPicking(container) {
 
 /* ===== 翻新主数据管理（分类 + 绑定总览）===== */
 async function renderRenoMaster(container) {
-  container.innerHTML = navbar('翻新主数据管理', true) + `<div class="page-body has-tab">
+  container.innerHTML = navbar('翻新主数据管理', true) + `<div class="page-body">
     <div class="card"><div class="card-title">翻新分类</div><div id="rm-cats"><div class="loading">加载中...</div></div></div>
     <div class="card" style="margin-top:12px"><div class="card-title">SKU 包材绑定总览</div><div id="rm-binds"><div class="loading">加载中...</div></div></div>
   </div>`;
@@ -3436,7 +3545,15 @@ async function renderRenoMaster(container) {
       ]);
       $('#rm-cats').innerHTML = cats.length ? cats.map(c => `<div class="li-row"><span>${esc(c.category_name)}</span><span class="badge ${c.is_active ? 'teal' : 'red'}">${c.is_active ? '启用' : '停用'}</span></div>`).join('') : '<div class="empty">无分类</div>';
       const bindCount = binds ? binds.length : 0;
-      $('#rm-binds').innerHTML = bindCount ? `<div class="li-row"><span>绑定记录:<b>${fmtQty(bindCount)}</b></span></div>${binds.slice(0, 30).map(b => `<div class="li-row"><span>${esc(JSON.stringify(Object.values(b).slice(1, 4)).replace(/["\[\]]/g, ''))}</span></div>`).join('')}<div style="font-size:11px;color:var(--muted);margin-top:6px">仅显示前 30 条</div>` : '<div class="empty">暂无绑定数据</div>';
+      if (bindCount) {
+        const sample = binds[0];
+        const cols = Object.keys(sample).filter(k => k !== 'id' && k !== 'created_at' && k !== 'updated_at' && k !== 'created_by');
+        $('#rm-binds').innerHTML = `<div class="li-row" style="margin-bottom:6px"><span>绑定记录:<b>${fmtQty(bindCount)}</b></span></div>` +
+          binds.slice(0, 30).map(b => `<div class="li-row"><span>${cols.map(c => `${esc(c)}: ${esc(b[c] ?? '-')}`).join(' · ')}</span></div>`).join('') +
+          `<div style="font-size:11px;color:var(--muted);margin-top:6px">仅显示前 30 条</div>`;
+      } else {
+        $('#rm-binds').innerHTML = '<div class="empty">暂无绑定数据</div>';
+      }
       const div = document.createElement('div');
       div.className = 'card'; div.style.marginTop = '12px';
       div.innerHTML = `<div class="card-title">无需翻新 SKU 列表（${noReno.length}）</div><div style="max-height:200px;overflow:auto;font-size:12px;color:var(--muted-foreground)">${noReno.slice(0, 100).map(x => esc(x.sku)).join('、')}</div>${noReno.length > 100 ? '<div style="font-size:11px;margin-top:4px">… 共 ' + noReno.length + ' 个</div>' : ''}`;
@@ -3506,13 +3623,12 @@ async function renderStockApply(container) {
       <div class="field"><label class="req">申请数量</label><input class="inp" id="sf-qty" type="number" min="1"></div>
       <div class="field"><label>备注</label><input class="inp" id="sf-remark" placeholder="用途/说明"></div>
       <button class="btn primary" id="sf-submit" style="width:100%">提交申请</button></div>`;
-    const dlg = el('div', 'modal-mask');
-    dlg.innerHTML = `<div class="modal" style="max-width:420px;margin:auto;...">${navbar('提交库存申请', true)}${html}</div>`;
+    const dlg = el('div');
     dlg.style.cssText = 'position:fixed;inset:0;z-index:999;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center';
     const box = el('div');
     box.style.cssText = 'background:#fff;border-radius:16px;max-width:440px;width:88%;padding:0 0 14px';
     box.innerHTML = navbar('提交库存申请', true) + html;
-    dlg.innerHTML = ''; dlg.appendChild(box);
+    dlg.appendChild(box);
     document.body.appendChild(dlg);
     box.querySelector('.back').onclick = () => dlg.remove();
     box.querySelector('#sf-submit').onclick = async () => {
