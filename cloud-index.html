@@ -267,22 +267,47 @@ select.inp{appearance:none;background:#fff url("data:image/svg+xml,%3Csvg xmlns=
 })();
 
 'use strict';
-/* 工业级扫码组件 v3 —— 准且快（微信式：识别即弹结果条，2秒自动确认）
- * 防误读：识别值弹条展示，人工肉眼复核 + 内容白名单拦截明显错误
- * 交互：双指缩放 / 点按对焦 / 手电筒 / 手动输入 / 连续扫码
+/* 工业级扫码组件 v4 —— 兼容自带浏览器
+ * 首选原生 BarcodeDetector；不支持时（多数手机自带浏览器）自动加载 ZXing JS 兜底
+ * 交互：识别即弹结果条 + 2秒自动确认；双指缩放/点按对焦/手电筒/手动输入
  * 用法：scanCode('输入框id', 'sku|loc|code')
  */
+
+// ZXing 加载器（仅在需要时拉 CDN）
+let _zxingLoaded = null;
+function loadZXing() {
+  if (window.ZXing) return Promise.resolve(window.ZXing);
+  if (_zxingLoaded) return _zxingLoaded;
+  _zxingLoaded = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js';
+    s.onload = () => resolve(window.ZXing);
+    s.onerror = () => { _zxingLoaded = null; reject(new Error('ZXing 加载失败')); };
+    document.head.appendChild(s);
+  });
+  return _zxingLoaded;
+}
+
 async function scanCode(targetId, type) {
   const target = document.getElementById(targetId);
   if (!target) return toast('扫码目标输入框不存在', true);
-  if (!('BarcodeDetector' in window)) {
-    return toast('当前浏览器不支持扫码，请用安卓 Chrome/Edge 或 iPhone Safari 打开。可点 ⌨️ 手动输入', true);
-  }
   type = type || (function () {
     if (/loc|shelf|储位/i.test(targetId) || /储位/i.test(target.placeholder || '')) return 'loc';
     if (/sku/i.test(targetId)) return 'sku';
     return 'code';
   })();
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    return toast('当前浏览器无法访问摄像头，请用手机自带浏览器或 Chrome 打开，或点输入框旁⌨️手动输入', true);
+  }
+
+  // 引擎：原生优先，否则 ZXing
+  let useNative = 'BarcodeDetector' in window;
+  let zxReader = null;
+  if (!useNative) {
+    try { const Z = await loadZXing(); zxReader = new Z.BrowserMultiFormatReader(undefined, { delayBetweenScanAttempts: 150 }); }
+    catch { return toast('扫码组件加载失败（请检查网络），可手动输入', true); }
+  }
 
   let stream;
   try {
@@ -291,7 +316,7 @@ async function scanCode(targetId, type) {
       audio: false,
     });
   } catch (e) {
-    return toast('无法访问摄像头：' + (e.message || '请允许摄像头权限，或点 ⌨️ 手动输入'), true);
+    return toast('无法访问摄像头：' + (e.message || '请在浏览器设置里允许摄像头权限，或手动输入'), true);
   }
   const track = stream.getVideoTracks()[0];
   const caps = track.getCapabilities ? track.getCapabilities() : {};
@@ -353,45 +378,44 @@ async function scanCode(targetId, type) {
   const torchBtn = layer.querySelector('#sc-torch');
   if (torchBtn) torchBtn.onclick = async () => {
     torchOn = !torchOn;
-    try { await track.applyConstraints({ advanced: [{ torch: torchOn }] }); torchBtn.style.background = torchOn ? 'rgba(255,255,255,.8)' : 'rgba(255,255,255,.12)'; torchBtn.style.color = torchOn ? '#000' : '#fff'; } catch {}
+    try { await track.applyConstraints({ advanced: [{ torch: torchOn }] }); torchBtn.style.background = torchOn ? 'rgba(255,255,255,.8)' : 'rgba(255,255,255,.12)'; torchBtn.style.color = torchOn ? '#000' : '#fff'; } catch { toast('此手机不支持手电筒', true); }
   };
-  const close = () => { clearInterval(timer); clearInterval(hideTimer); stream.getTracks().forEach(t => t.stop()); layer.remove(); };
-  layer.querySelector('#sc-cancel').onclick = close;
-
-  let detector;
-  try { detector = new window.BarcodeDetector({ formats: ['code_128', 'code_39', 'ean_13', 'ean_8', 'qr_code', 'data_matrix', 'itf', 'codabar'] }); }
-  catch { detector = new window.BarcodeDetector(); }
-
-  // 识别结果条：展示值 → 倒计时自动确认（也可点立即填入）
   const hitBox = layer.querySelector('#sc-hit');
   const hitVal = layer.querySelector('#sc-hit-val');
   const hitCnt = layer.querySelector('#sc-hit-cnt');
-  let confirmTimer = null, hideTimer = null, showingVal = null;
+  let confirmTimer = null, showingVal = null, closed = false;
+
+  const close = () => {
+    if (closed) return; closed = true;
+    clearInterval(timer); clearInterval(confirmTimer);
+    if (zxReader) { try { zxReader.reset(); } catch {} }
+    stream.getTracks().forEach(t => t.stop());
+    layer.remove();
+  };
+  layer.querySelector('#sc-cancel').onclick = close;
 
   function validate(v) {
     if (type === 'loc' && !/^(AA|AB|AC|HC|DD|FX|BF|HX)-/i.test(v)) return '储位编码应以 AA-/AB- 等开头';
     if (type === 'sku' && /^(AA|AB|AC|HC|DD|FX|BF|HX)-\d/i.test(v)) return '这是储位编码，不是 SKU';
     return null;
   }
-
   function showHit(v) {
     const err = validate(v);
     if (err) { toast(err + '：' + v, true); navigator.vibrate && navigator.vibrate([60, 60]); return; }
+    if (showingVal === v && hitBox.style.display === 'block') return;
     showingVal = v;
     hitVal.textContent = v;
     hitBox.style.display = 'block';
-    hitBox.style.background = '#fff';
-    clearInterval(confirmTimer); clearInterval(hideTimer);
+    clearInterval(confirmTimer);
     let n = 2;
     hitCnt.textContent = n;
     confirmTimer = setInterval(() => {
       n--;
       hitCnt.textContent = n;
-      if (n <= 0) { confirmTimer && clearInterval(confirmTimer); doFill(); }
+      if (n <= 0) { clearInterval(confirmTimer); doFill(); }
     }, 1000);
   }
-  hitBox.onclick = () => { confirmTimer && clearInterval(confirmTimer); doFill(); };
-
+  hitBox.onclick = () => { clearInterval(confirmTimer); doFill(); };
   function doFill() {
     if (!showingVal) return;
     const v = showingVal;
@@ -405,23 +429,38 @@ async function scanCode(targetId, type) {
     const sib = wrap && wrap.querySelector('button');
     if (sib && /search|查询|搜索/i.test(sib.textContent)) sib.click();
   }
-
   layer.querySelector('#sc-input').onclick = () => {
     const v = prompt('手动输入：');
     if (v) showHit(v.trim());
   };
 
-  // 连续帧轻验证：连续 2 帧同值才弹条（过滤单帧噪声），识别到即弹
-  let lastVal = '', lastValCnt = 0;
-  const timer = setInterval(async () => {
-    try {
-      const codes = await detector.detect(video);
-      const v = codes && codes.length ? codes[0].rawValue : '';
-      if (!v) { lastValCnt = 0; return; }
-      if (v === lastVal) { lastValCnt++; } else { lastVal = v; lastValCnt = 1; }
-      if (lastValCnt >= 2 && hitBox.style.display !== 'block') showHit(v);
-    } catch {}
-  }, 200);
+  // ===== 识别引擎 =====
+  let timer = null;
+  if (useNative) {
+    // 原生：200ms 轮询帧，连续 2 帧同值才弹条
+    let lastVal = '', lastCnt = 0;
+    timer = setInterval(async () => {
+      if (closed || hitBox.style.display === 'block') return;
+      try {
+        const codes = await detector.detect(video);
+        const v = codes && codes.length ? codes[0].rawValue : '';
+        if (!v) { lastCnt = 0; return; }
+        if (v === lastVal) lastCnt++; else { lastVal = v; lastCnt = 1; }
+        if (lastCnt >= 2) showHit(v);
+      } catch {}
+    }, 200);
+  } else {
+    // ZXing：持续解码，回调有结果即弹条（连续 2 次不同帧同值）
+    let lastVal = '', lastCnt = 0, lastT = 0;
+    zxReader.decodeFromVideoDevice(undefined, video, (result) => {
+      if (closed || !result || hitBox.style.display === 'block') return;
+      const v = result.getText();
+      if (!v) return;
+      const now = Date.now();
+      if (v === lastVal) { lastCnt++; } else { lastVal = v; lastCnt = 1; }
+      if (lastCnt >= 2 && now - lastT > 800) { lastT = now; showHit(v); }
+    }).catch(() => {});
+  }
 }
 
 'use strict';
@@ -1462,17 +1501,14 @@ async function renderStockIO(container, query) {
 async function renderFGStock(container) {
   container.innerHTML = navbar('实物库存查询', true, `<button class="btn tiny ghost" id="fg-export">⬇️ 导出</button>`) + `
   <div class="page-body">
-    <div class="search-bar"><input class="inp" id="fg-q" placeholder="SKU / 储位号"><button class="btn ghost" onclick="scanCode('fg-q','sku')">📷</button><button class="btn primary" id="fg-search">搜索</button></div>
-    <div id="fg-stats"><div class="loading">加载中...</div></div>
-    <div class="filter-row" id="fg-zone">
-      <button class="chip active" data-v="">全部储区</button>
-      <button class="chip" data-v="AA">AA(拣货)</button>
-      <button class="chip" data-v="AB">AB(成品)</button>
-      <button class="chip" data-v="AC">AC(分货)</button>
+    <div class="search-bar"><input class="inp" id="fg-q" placeholder="输入SKU/储位号自动搜索"><button class="btn ghost" onclick="scanCode('fg-q','sku')">📷</button></div>
+    <div class="filter-row" id="fg-kind">
+      <button class="chip active" data-v="">全部</button><button class="chip" data-v="bad">❌ 不良品</button><button class="chip" data-v="new">✨ 全新品</button>
     </div>
+    <div id="fg-stats"><div class="loading">加载中...</div></div>
     <div id="fg-list"></div>
   </div>`;
-  let zone = '';
+  let kind = '';
   let lastFgList = [], lastHighMap = {};
   $('#fg-export').onclick = () => {
     if (!lastFgList.length) return toast('请先加载数据', true);
@@ -1483,7 +1519,7 @@ async function renderFGStock(container) {
         'SKU': f.sku, '系统库存': f.system_stock || 0, '实物总量': phy,
         '地堆位': f.ground_location || '-', '地堆数量': f.ground_quantity || 0,
         '高架位': highs.map(h => h.location).join(' / ') || '-', '高架数量': highs.map(h => h.quantity).join(' / ') || (f.high_shelf_quantity || 0),
-        '拣货位': f.pick_location || '-', '拣货数量': f.pick_quantity || 0,
+        '拣货位': f.pick_location || '-', '拣货数量': f.pick_quantity || 0, '全新品数量': f.new_quantity || 0,
       };
     }), '实物库存', '库存');
   };
@@ -1491,39 +1527,25 @@ async function renderFGStock(container) {
     const listEl = $('#fg-list'), statEl = $('#fg-stats');
     listEl.innerHTML = '<div class="loading">加载中...</div>';
     try {
-      const params = new URLSearchParams();
       const q = trim($('#fg-q').value);
-      if (q) params.set('q', q);
-      if (zone) params.set('zone', zone);
       let r;
       if (isCloud()) {
-        // 云端模式：全量加载（缓存 60s）+ 前端过滤，彻底避免 PostgREST 复杂 filter 导致 400
+        // 全量加载（缓存 60s）+ 前端过滤，避免 PostgREST filter 400
         const all = await supa.rest('finished_goods_stock', { select: 'sku,system_stock,ground_location,ground_quantity,high_shelf_location,high_shelf_quantity,pick_location,pick_quantity,new_quantity', order: 'sku', limit: 5000, cacheMs: 60000 });
         let list = all;
         if (q) {
           const ql = q.toLowerCase();
-          list = all.filter(f => [f.sku, f.ground_location, f.high_shelf_location, f.pick_location].some(v => v && String(v).toLowerCase().includes(ql)));
+          list = list.filter(f => [f.sku, f.ground_location, f.high_shelf_location, f.pick_location].some(v => v && String(v).toLowerCase().includes(ql)));
         }
-        if (zone) {
-          const zf = zone + '-';
-          list = list.filter(f => (f.ground_location && String(f.ground_location).startsWith(zf)) || (f.high_shelf_location && String(f.high_shelf_location).includes(zf)) || (f.pick_location && String(f.pick_location).startsWith(zf)));
-        }
+        if (kind === 'new') list = list.filter(f => Number(f.new_quantity) > 0);
+        if (kind === 'bad') list = list.filter(f => (Number(f.ground_quantity) || 0) + (Number(f.high_shelf_quantity) || 0) + (Number(f.pick_quantity) || 0) > 0);
         const pageList = list.slice(0, 500);
-        // 高架明细：用 in= 批量查（最多 50 个一批）
+        // 高架明细
         const highMap = {};
         const skuList = pageList.map(x => x.sku).filter(Boolean);
         if (skuList.length) {
-          const allHigh = skuList.length > 50
-            ? await supa.rest('finished_goods_stock_high_shelves', { select: 'sku,location,quantity', order: 'created_at', limit: 5000, cacheMs: 60000 }).then(rows => rows.filter(h => skuList.includes(h.sku)))
-            : await (async () => {
-                let acc = [];
-                for (let i = 0; i < skuList.length; i += 50) {
-                  const batch = skuList.slice(i, i + 50);
-                  const rows = await supa.rest('finished_goods_stock_high_shelves', { select: 'sku,location,quantity', filter: `sku=in.(${batch.join(',')})`, order: 'created_at', limit: 1000 });
-                  acc = acc.concat(rows);
-                }
-                return acc;
-              })();
+          const allHigh = await supa.rest('finished_goods_stock_high_shelves', { select: 'sku,location,quantity', order: 'created_at', limit: 5000, cacheMs: 60000 })
+            .then(rows => rows.filter(h => skuList.includes(h.sku)));
           allHigh.forEach(h => { (highMap[h.sku] = highMap[h.sku] || []).push({ location: h.location, quantity: h.quantity }); });
         }
         const sum = (a, k) => a.reduce((s, x) => s + (Number(x[k]) || 0), 0);
@@ -1538,13 +1560,15 @@ async function renderFGStock(container) {
           },
         };
       } else {
+        const params = new URLSearchParams();
+        if (q) params.set('q', q);
         r = await api('/finished-goods?' + params.toString());
       }
       const s = r.stats;
       statEl.innerHTML = `
       <div class="stat-grid">
         <div class="stat-card"><div class="label">📦 实物在库 SKU</div><div class="value">${fmtQty(s.totalSkus)}</div><div class="sub">零库存 ${fmtQty(s.zeroSkus)} 款</div></div>
-        <div class="stat-card"><div class="label">📊 逆向总库存</div><div class="value">${fmtQty(s.totalQty)}</div><div class="sub">地堆 ${fmtQty(s.groundQty)} · 高架 ${fmtQty(s.highQty)} · 拣货 ${fmtQty(s.pickQty)}</div></div>
+        <div class="stat-card"><div class="label">📊 逆向总库存</div><div class="value">${fmtQty(s.totalQty)}</div><div class="sub">地堆 ${fmtQty(s.groundQty)} · 高架 ${fmtQty(s.highQty)}</div></div>
       </div>
       <div class="stat-card" style="margin-bottom:12px;background:linear-gradient(135deg,#f0fdf4,#dcfce7)"><div class="label">✨ 全新品</div><div class="value" style="color:var(--green)">${fmtQty(s.newQty)}</div></div>`;
       if (!r.list.length) { lastFgList = []; return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>未找到库存记录</div>'; }
@@ -1554,14 +1578,13 @@ async function renderFGStock(container) {
         const phy = (Number(f.ground_quantity) || 0) + (Number(f.high_shelf_quantity) || 0) + (Number(f.pick_quantity) || 0);
         const sys = Number(f.system_stock || 0);
         const low = phy > 0 && sys < phy;
-        // 账实差异提示（用户确认的商家常态：差异≥10 且 ≥系统数20% 时标提示）
         const gap = phy - sys;
         const gapBig = phy > 0 && Math.abs(gap) >= 10 && Math.abs(gap) >= Math.abs(sys) * 0.2;
         return `
         <div class="list-item">
           <div class="li-head"><span class="li-name">${esc(f.sku)}</span>
             <span style="display:flex;gap:5px;align-items:center">
-              ${gapBig ? `<span class="badge" style="background:#fff7ed;color:#c2410c" onclick="location.hash='#/stock-gap'" title="系统数与实物数差距较大，点开看差异清单">⚠️ 账实差 ${fmtQty(gap > 0 ? '+' + gap : gap)}</span>` : ''}
+              ${gapBig ? `<span class="badge" style="background:#fff7ed;color:#c2410c" onclick="location.hash='#/stock-gap'">⚠️ 账实差 ${fmtQty(gap > 0 ? '+' + gap : gap)}</span>` : ''}
               ${f.new_quantity > 0 ? '<span class="badge teal">全新品 ' + fmtQty(f.new_quantity) + '</span>' : ''}
               <span style="font-size:13px;font-weight:700">${low ? '<span style="color:var(--red)">' + fmtQty(phy) + '</span>' : fmtQty(phy)}</span>
             </span></div>
@@ -1569,16 +1592,16 @@ async function renderFGStock(container) {
           <div class="li-row"><span>地堆位 <b>${f.ground_location ? esc(f.ground_location) : '-'}</b> · ${fmtQty(f.ground_quantity)}</span></div>
           ${highs.length ? highs.map((h, i) => `<div class="li-row"><span>高架位${highs.length > 1 ? i + 1 : ''} <b>${esc(h.location)}</b> · ${fmtQty(h.quantity)}</span></div>`).join('') :
             `<div class="li-row"><span>高架位 - · ${fmtQty(f.high_shelf_quantity)}</span></div>`}
-          <div class="li-row"><span>拣货位 <b>${f.pick_location ? esc(f.pick_location) : '-'}</b> · ${fmtQty(f.pick_quantity)}</span></div>
         </div>`;
       }).join('');
     } catch (e) { listEl.innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
   };
-  $('#fg-search').onclick = load;
-  $('#fg-q').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
-  $('#fg-zone').querySelectorAll('.chip').forEach(ch => ch.onclick = () => {
-    zone = ch.dataset.v;
-    $('#fg-zone').querySelectorAll('.chip').forEach(x => x.classList.toggle('active', x === ch));
+  // 自动搜索：输入停顿 300ms 自动执行，不用点按钮
+  let debounceT = null;
+  $('#fg-q').addEventListener('input', () => { clearTimeout(debounceT); debounceT = setTimeout(load, 300); });
+  $('#fg-kind').querySelectorAll('.chip').forEach(ch => ch.onclick = () => {
+    kind = ch.dataset.v;
+    $('#fg-kind').querySelectorAll('.chip').forEach(x => x.classList.toggle('active', x === ch));
     load();
   });
   load();
@@ -1836,7 +1859,7 @@ async function renderRenoStats(container) {
 
 /* ===== 翻新后库存查询 ===== */
 async function renderRenoInventory(container) {
-  container.innerHTML = navbar('翻新后库存查询', true) + `
+  container.innerHTML = navbar('翻新后库存查询', true, `<button class="btn tiny ghost" id="ri-export">⬇️ 导出</button>`) + `
   <div class="page-body">
     <div class="search-bar"><input class="inp" id="ri-q" placeholder="SKU / 储位号"><button class="btn primary" id="ri-search">搜索</button></div>
     <div class="filter-row" id="ri-status">
@@ -1854,6 +1877,14 @@ async function renderRenoInventory(container) {
     <div id="ri-list"><div class="loading">加载中...</div></div>
   </div>`;
   let status = '', stage = '', cond = '', month = '';
+  let lastRiList = [];
+  $('#ri-export').onclick = () => {
+    if (!lastRiList.length) return toast('请先加载数据', true);
+    exportExcel(lastRiList.map(x => ({
+      'SKU': x.sku || '', '储位': x.shelf_no || '', '状态': x.status || '', '成色': x.condition || '',
+      '数量': x.quantity || 0, '阶段': x.stage || '', '渠道': x.channel || '', '所属月份': x.belong_month || '',
+    })), '翻新后库存', '翻新库存');
+  };
   const load = async () => {
     const listEl = $('#ri-list');
     listEl.innerHTML = '<div class="loading">加载中...</div>';
@@ -1879,7 +1910,8 @@ async function renderRenoInventory(container) {
       } else {
         r = await api('/renovation-inventory?' + params.toString());
       }
-      if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无库存</div>';
+      if (!r.list.length) { lastRiList = []; return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无库存</div>'; }
+      lastRiList = r.list;
       listEl.innerHTML = r.list.map(x => `
       <div class="list-item">
         <div class="li-head"><span class="li-name">${esc(x.sku)}</span>
@@ -1907,7 +1939,7 @@ async function renderRenoInventory(container) {
 
 /* ===== 拆包统计 ===== */
 async function renderUnpackStats(container) {
-  container.innerHTML = navbar('拆包统计', true) + `
+  container.innerHTML = navbar('拆包统计', true, `<button class="btn tiny ghost" id="up-export">⬇️ 导出</button>`) + `
   <div class="page-body">
     <div class="card">
       <div style="display:flex;gap:8px">
@@ -1918,6 +1950,11 @@ async function renderUnpackStats(container) {
     </div>
     <div id="up-body"><div class="loading">加载中...</div></div>
   </div>`;
+  let lastUpRows = [];
+  $('#up-export').onclick = () => {
+    if (!lastUpRows.length) return toast('请先加载数据', true);
+    exportExcel(lastUpRows, '拆包统计', '拆包');
+  };
   const load = async () => {
     const params = new URLSearchParams();
     if ($('#up-from').value) params.set('from', $('#up-from').value);
@@ -1931,13 +1968,12 @@ async function renderUnpackStats(container) {
         const f = [];
         if (fromDate) f.push(`created_at=gte.${fromDate}`);
         if (toDate) f.push(`created_at=lte.${toDate} 23:59:59`);
-        if (fromDate) f.push(`created_at=gte.${fromDate}`);
-        if (toDate) f.push(`created_at=lte.${toDate} 23:59:59`);
         const list = await supa.rest('unpacking_records', { select: 'worker_name,quantity,sku,created_at', filter: f.join('&'), limit: 1000 });
         const byWorker = {};
         let totalQty = 0;
         list.forEach(x => { const k = x.worker_name || '未知'; byWorker[k] = (byWorker[k] || { cnt: 0, qty: 0 }); byWorker[k].cnt++; byWorker[k].qty += Number(x.quantity || 0); totalQty += Number(x.quantity || 0); });
         r = { byWorker: Object.entries(byWorker).map(([worker_name, v]) => ({ worker_name, ...v })).sort((a, b) => b.qty - a.qty).slice(0, 50), total: { cnt: list.length, qty: totalQty } };
+        lastUpRows = r.byWorker.map(w => ({ '录入人': w.worker_name, '单数': w.cnt, '件数': Math.round(w.qty), '均单产': w.cnt ? (w.qty / w.cnt).toFixed(1) : 0 }));
       } else {
         r = await api('/unpacking/stats?' + params.toString());
       }
@@ -1961,7 +1997,7 @@ async function renderUnpackStats(container) {
 
 /* ===== 热度标签 ===== */
 async function renderHeatLabels(container) {
-  container.innerHTML = navbar('热度标签管理', true) + `
+  container.innerHTML = navbar('热度标签管理', true, `<button class="btn tiny ghost" id="hl-export">⬇️ 导出</button>`) + `
   <div class="page-body">
     <div class="search-bar"><input class="inp" id="hl-q" placeholder="搜索 SKU"><button class="btn primary" id="hl-search">搜索</button></div>
     <div class="filter-row" id="hl-filter">
@@ -1970,6 +2006,14 @@ async function renderHeatLabels(container) {
     <div id="hl-list"><div class="loading">加载中...</div></div>
   </div>`;
   let label = '';
+  let lastHlList = [];
+  $('#hl-export').onclick = () => {
+    if (!lastHlList.length) return toast('请先加载数据', true);
+    exportExcel(lastHlList.map(x => ({
+      'SKU': x.sku, '标签': x.label === 'hot' ? '爆品' : x.label === 'cold' ? '淡品' : '常规',
+      '手动设定': x.is_manual ? '是' : '否', '近7日入库': x.last_7d_inbound || 0, '昨日入库': x.yesterday_inbound || 0, '总库存': x.total_stock || 0,
+    })), '热度标签', '热度');
+  };
   const LABEL_BADGE = { hot: '<span class="badge red">🔥 爆品</span>', normal: '<span class="badge gray">常规</span>', cold: '<span class="badge teal">❄️ 淡品</span>' };
   const load = async () => {
     const listEl = $('#hl-list');
@@ -1990,7 +2034,8 @@ async function renderHeatLabels(container) {
       } else {
         r = await api('/heat-labels?' + params.toString());
       }
-      if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无标签</div>';
+      if (!r.list.length) { lastHlList = []; return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无标签</div>'; }
+      lastHlList = r.list;
       listEl.innerHTML = r.list.map(x => `
       <div class="list-item">
         <div class="li-head"><span class="li-name">${esc(x.sku)}</span>${LABEL_BADGE[x.label] || ''}</div>
@@ -2010,7 +2055,7 @@ async function renderHeatLabels(container) {
 
 /* ===== 账实差异提示（系统数 vs 实物数 差距大的 SKU）===== */
 async function renderStockGap(container) {
-  container.innerHTML = navbar('账实差异提醒', true) + `
+  container.innerHTML = navbar('账实差异提醒', true, `<button class="btn tiny ghost" id="sg-export">⬇️ 导出</button>`) + `
   <div class="page-body">
     <div class="card" style="background:var(--orange-soft);border:1px solid #fdba74">
       <div style="font-size:13px;line-height:1.7;color:#9a3412">
@@ -2041,6 +2086,17 @@ async function renderStockGap(container) {
       } else {
         r = await api('/stock-gap?' + params.toString());
       }
+      $('#sg-export').onclick = () => {
+        if (!r.list.length) return toast('暂无数据', true);
+        exportExcel(r.list.map(x => ({
+          'SKU': x.sku,
+          '系统库存': x.sys_qty,
+          '实物库存': x.phy_qty,
+          '差异件数': x.gap > 0 ? `+${x.gap}` : x.gap,
+          '差异方向': x.gap > 0 ? '实物多于系统（账面少记）' : '系统多于实物（账面多记）',
+          '差异率': x.sys_qty ? Math.abs(x.gap / x.sys_qty * 100).toFixed(1) + '%' : '100%',
+        })), '账实差异清单', '差异');
+      };
       if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">✅</span>没有差距较大的 SKU</div>';
       listEl.innerHTML = r.list.map(x => `
       <div class="list-item">
@@ -2057,11 +2113,16 @@ async function renderStockGap(container) {
 
 /* ===== 分货映射 ===== */
 async function renderDistrMapping(container) {
-  container.innerHTML = navbar('分货基础数据', true) + `
+  container.innerHTML = navbar('分货基础数据', true, `<button class="btn tiny ghost" id="dm-export">⬇️ 导出</button>`) + `
   <div class="page-body">
     <div class="search-bar"><input class="inp" id="dm-q" placeholder="SKU / 通道 / 储位"><button class="btn primary" id="dm-search">搜索</button></div>
     <div id="dm-list"><div class="loading">加载中...</div></div>
   </div>`;
+  let lastDmList = [];
+  $('#dm-export').onclick = () => {
+    if (!lastDmList.length) return toast('请先加载数据', true);
+    exportExcel(lastDmList.map(x => ({ 'SKU': x.sku || '', '通道': x.channel || '', '储位': x.location || '' })), '分货映射', '分货');
+  };
   const load = async () => {
     const listEl = $('#dm-list');
     listEl.innerHTML = '<div class="loading">加载中...</div>';
@@ -2074,7 +2135,8 @@ async function renderDistrMapping(container) {
       } else {
         r = await api('/picking-mappings' + (q ? `?q=${encodeURIComponent(q)}` : ''));
       }
-      if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无映射数据</div>';
+      if (!r.list.length) { lastDmList = []; return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无映射数据</div>'; }
+      lastDmList = r.list;
       listEl.innerHTML = r.list.map(x => `
       <div class="list-item">
         <div class="li-head"><span class="li-name">${esc(x.sku)}</span><span class="badge teal">通道 ${esc(x.channel || '-')}</span></div>
@@ -2090,7 +2152,7 @@ async function renderDistrMapping(container) {
 /* ===== 账号管理 ===== */
 async function renderUsers(container) {
   if (!isAdmin()) { container.innerHTML = navbar('账号管理', true) + '<div class="page-body"><div class="empty"><span class="emoji">🔒</span>仅管理员可访问</div></div>'; return; }
-  container.innerHTML = navbar('账号管理', true, `<button class="btn tiny primary" id="u-add">+ 新增</button>`) + `
+  container.innerHTML = navbar('账号管理', true, `<button class="btn tiny ghost" id="u-export">⬇️ 导出</button><button class="btn tiny primary" id="u-add">+ 新增</button>`) + `
   <div class="page-body"><div id="u-body"><div class="loading">加载中...</div></div></div>`;
   const load = async () => {
     try {
@@ -2110,6 +2172,14 @@ async function renderUsers(container) {
       } else {
         r = await api('/users');
         if (!r.summary) r.summary = r.list.reduce((s, u) => { s[u.role] = (s[u.role] || 0) + 1; return s; }, {});
+      }
+      if (!$('#u-export')) return;
+      if (!$('#u-export').dataset.binded) {
+        $('#u-export').dataset.binded = '1';
+        $('#u-export').onclick = () => exportExcel(r.list.map(u => ({
+          '用户名': u.username, '角色': ROLE_NAME[u.role] || u.role, '状态': u.status === 'active' ? '启用' : '停用',
+          '权限数': (u.permissions || []).length,
+        })), '账号列表', '账号');
       }
       const s = r.summary;
       $('#u-body').innerHTML = `
@@ -2180,7 +2250,7 @@ function userForm(u, onDone) {
 
 /* ===== 在途库存 ===== */
 async function renderTransit(container) {
-  container.innerHTML = navbar('在途库存', true) + `
+  container.innerHTML = navbar('在途库存', true, `<button class="btn tiny ghost" id="ti-export">⬇️ 导出</button>`) + `
   <div class="page-body">
     <div class="filter-row" id="tr-status">
       <button class="chip active" data-v="">全部</button><button class="chip" data-v="transit">🚚 在途</button><button class="chip" data-v="received">✅ 已到仓</button><button class="chip" data-v="cancelled">已取消</button>
@@ -2188,6 +2258,15 @@ async function renderTransit(container) {
     <div id="tr-list"><div class="loading">加载中...</div></div>
   </div>`;
   let status = '';
+  let lastTiList = [];
+  $('#ti-export').onclick = () => {
+    if (!lastTiList.length) return toast('请先加载数据', true);
+    const TAG2 = { transit: '在途', received: '已到仓', cancelled: '已取消' };
+    exportExcel(lastTiList.map(x => ({
+      '包材编码': x.consumable_code || '', '名称': x.consumable_name || '', '数量': x.qty || 0,
+      '状态': TAG2[x.status] || x.status, '备注': x.remark || '', '登记时间': (x.created_at || '').replace('T', ' ').slice(0, 19),
+    })), '在途库存', '在途');
+  };
   const load = async () => {
     const listEl = $('#tr-list');
     listEl.innerHTML = '<div class="loading">加载中...</div>';
@@ -2199,7 +2278,8 @@ async function renderTransit(container) {
       } else {
         r = await api('/transit' + (status ? `?status=${status}` : ''));
       }
-      if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无在途记录</div>';
+      if (!r.list.length) { lastTiList = []; return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无在途记录</div>'; }
+      lastTiList = r.list;
       const TAG = { transit: '<span class="badge orange">🚚 在途</span>', received: '<span class="badge green">✅ 已到仓</span>', cancelled: '<span class="badge gray">已取消</span>' };
       listEl.innerHTML = r.list.map(x => `
       <div class="list-item">
@@ -2219,17 +2299,22 @@ async function renderTransit(container) {
 
 /* ===== 箱唛标签打印（成品） ===== */
 async function renderBoxLabel(container) {
-  // 管理员可调格式：localStorage 持久化（仅本设备，管理员调整后其他设备各自设）
-  const DEF_FMT = { skuSize: 22, locSize: 26, showHeat: true, showCategory: true, showQty: true };
+  // 管理员可调格式：localStorage 持久化（仅本设备）
+  const DEF_FMT = { skuSize: 22, locSize: 26, showQty: true };
   const fmt = Object.assign({}, DEF_FMT, (function(){ try { return JSON.parse(localStorage.getItem('xiaoan_label_fmt') || '{}'); } catch { return {}; } })());
+  const histCats = JSON.parse(localStorage.getItem('xiaoan_label_cats') || '{}');
   container.innerHTML = navbar('箱唛标签打印', true, isAdmin() ? `<button class="btn tiny ghost" id="bl-fmt">⚙️ 格式</button>` : '') + `
   <div class="page-body">
     <div class="card">
       <div class="field"><label class="req">SKU</label>
         <div class="input-group"><span class="ig-ico">📦</span><input id="bl-sku" placeholder="输入或扫 SKU"><button class="btn tiny ghost" onclick="scanCode('bl-sku','sku')">📷</button><button class="btn tiny primary" id="bl-query">查询</button></div></div>
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <div class="field" style="flex:1"><label>数量</label><input class="inp" id="bl-qty" type="number" min="1" placeholder="本箱数量"></div>
+        <div class="field" style="flex:2"><label>品类（自动记忆）</label><input class="inp" id="bl-cat" list="bl-cat-list" placeholder="可选/可输"><datalist id="bl-cat-list">${[...new Set(Object.values(histCats))].map(c => `<option value="${esc(c)}">`).join('')}</datalist></div>
+      </div>
       <div id="bl-preview" style="margin-top:10px"></div>
     </div>
-    <div style="font-size:12px;color:var(--muted-foreground);line-height:1.6;padding:0 4px">标签规格 100×150mm 满幅；拣货位一品一位打印拣货位条码，多品打印地堆/高架条码（Code128 可被扫码枪/手机识别）。</div>
+    <div style="font-size:12px;color:var(--muted-foreground);line-height:1.6;padding:0 4px">标签纸 100×150mm；推荐地堆位 + 数量最少且未禁用的高架位；Code128 条码可被扫码枪/手机识别；电脑端 Ctrl+P 打印。</div>
   </div>`;
   // 格式设置弹层（仅管理员）
   if (isAdmin()) $('#bl-fmt').onclick = () => {
@@ -2275,9 +2360,27 @@ async function renderBoxLabel(container) {
         if (!f) { r = { item: null }; }
         else {
           const highs = await supa.rest('finished_goods_stock_high_shelves', { select: 'location,quantity', filter: `sku=eq.${sku}` });
-          const heat = await supa.rest('sku_heat_labels', { select: 'label', filter: `sku=eq.${sku}`, single: true });
           const cat = await supa.rest('sku_category_memories', { select: 'category_name', filter: `sku=eq.${sku}`, single: true });
-          r = { item: { sku: f.sku, ground_location: f.ground_location, ground_quantity: f.ground_quantity, high_shelves: highs, pick_location: f.pick_location, pick_quantity: f.pick_quantity, heat_label: heat?.label || 'normal', category: cat?.category_name || '' } };
+          // 货架禁用规则（disable_label_print=1 的储位不推荐）
+          const restricts = (await supa.rest('shelf_restrictions', { select: 'shelf_no,disable_label_print', limit: 500, cacheMs: 30000 }))
+            .filter(s => Number(s.disable_label_print) === 1).map(s => s.shelf_no);
+          // 高架位推荐：数量最少且未被禁用打印的
+          const highAvail = highs.filter(h => Number(h.quantity) > 0 && !restricts.includes(h.location));
+          const recommendedHigh = highAvail.length
+            ? highAvail.slice().sort((a, b) => Number(a.quantity) - Number(b.quantity))[0]
+            : null;
+          // 品类优先级：用户输入框 > SKU记忆 > 云端归类
+          const histCats = JSON.parse(localStorage.getItem('xiaoan_label_cats') || '{}');
+          const userCat = trim(($('#bl-cat') || {}).value || '');
+          const catMem = cat?.category_name || histCats[sku] || '';
+          const finalCat = userCat || catMem;
+          r = { item: {
+            sku: f.sku, ground_location: f.ground_location, ground_quantity: f.ground_quantity,
+            high_shelves: highs, recommended_high: recommendedHigh,
+            category: finalCat,
+            category_source: userCat ? 'input' : (cat?.category_name ? 'cloud' : (histCats[sku] ? 'hist' : '')),
+            restricts,
+          } };
         }
       } else {
         r = await api('/box-label/fg?sku=' + encodeURIComponent(sku));
@@ -2285,43 +2388,61 @@ async function renderBoxLabel(container) {
       const pv = $('#bl-preview');
       if (!r.item) { pv.innerHTML = '<div style="color:var(--red);font-size:13px">❌ 未找到该 SKU</div>'; return; }
       const it = r.item;
-      const heatTxt = it.heat_label === 'hot' ? '🔥 爆品' : it.heat_label === 'cold' ? '❄️ 淡品' : '常规';
-      const locs = [];
-      if (it.ground_location && it.ground_quantity > 0) locs.push({ l: it.ground_location, t: '地堆', q: it.ground_quantity });
-      it.high_shelves.forEach(h => locs.push({ l: h.location, t: '高架', q: h.quantity }));
-      if (it.pick_location && it.pick_quantity > 0) locs.push({ l: it.pick_location, t: '拣货', q: it.pick_quantity });
-      // 真条码：SKU + 各储位 Code128
-      const skuBar = code128DataURL(it.sku, { height: 50, moduleWidth: 2 });
+      // 品类自动回填到输入框（来源非用户输入时），方便修改
+      if (it.category_source !== 'input' && it.category) $('#bl-cat').value = it.category;
       pv.innerHTML = `
-      <div class="label-print" style="border:2px solid #334155;border-radius:10px;padding:12px;background:#fff">
-        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px">
-          <span style="font-weight:800;font-size:${fmt.skuSize}px;letter-spacing:.5px;word-break:break-all">${esc(it.sku)}</span>
-          ${fmt.showHeat ? `<span class="badge ${it.heat_label === 'hot' ? 'red' : it.heat_label === 'cold' ? 'teal' : 'gray'}" style="flex-shrink:0">${heatTxt}</span>` : ''}
-        </div>
-        ${fmt.showCategory && it.category ? `<div style="font-size:13px;color:var(--muted-foreground);margin-bottom:8px">品类：${esc(it.category)}</div>` : ''}
-        <div style="text-align:center;margin:4px 0 10px"><img src="${skuBar}" alt="SKU条码" style="max-width:100%"></div>
-        ${locs.map(x => `
-        <div style="margin-top:10px;padding-top:8px;border-top:1px dashed var(--border)">
-          <div style="display:flex;justify-content:space-between;align-items:baseline">
-            <span style="font-size:12px;color:var(--muted-foreground)">${x.t}位 · ${esc(x.l)}</span>
-            ${fmt.showQty ? `<span style="font-size:13px;font-weight:700">${fmtQty(x.q)}</span>` : ''}
+      <div class="label-sheet">
+        <div class="label-print">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px">
+            <span style="font-weight:800;font-size:${fmt.skuSize}px;letter-spacing:.5px;word-break:break-all">${esc(it.sku)}</span>
           </div>
-          <div style="text-align:center;margin-top:4px"><img src="${code128DataURL(x.l, { height: 44, moduleWidth: 2, showText: true })}" alt="${esc(x.l)}条码" style="max-width:100%"></div>
-        </div>`).join('')}
+          ${it.category ? `<div style="font-size:13px;color:var(--muted-foreground);margin-bottom:6px">品类：${esc(it.category)}</div>` : ''}
+          <div style="text-align:center;margin:4px 0 8px"><img src="${code128DataURL(it.sku, { height: 46, moduleWidth: 2 })}" alt="SKU条码" style="max-width:100%"></div>
+          ${(function () {
+            // 推荐逻辑：地堆位（首推）+ 数量最少且未禁用的高架位
+            const lines = [];
+            if (it.ground_location && Number(it.ground_quantity) > 0) lines.push({ l: it.ground_location, t: '地堆位', q: it.ground_quantity, tag: '推荐' });
+            if (it.recommended_high) lines.push({ l: it.recommended_high.location, t: '高架位', q: it.recommended_high.quantity, tag: '推荐' });
+            const others = it.high_shelves.filter(h => Number(h.quantity) > 0).map(h => ({ l: h.location, t: '高架', q: h.quantity, tag: '' }));
+            const all = lines.concat(others.filter(o => !lines.find(x => x.l === o.l)));
+            return all.map(x => `
+            <div style="margin-top:8px;padding-top:6px;border-top:1px dashed var(--border)">
+              <div style="display:flex;justify-content:space-between;align-items:baseline">
+                <span style="font-size:${fmt.locSize}px;font-family:monospace;font-weight:800;letter-spacing:1px">${esc(x.l)}${x.tag === '推荐' ? ' <span style="font-size:10px;color:var(--green);font-weight:400">推荐</span>' : ''}</span>
+                ${fmt.showQty ? `<span style="font-size:13px;font-weight:700">${fmtQty(x.q)}</span>` : ''}
+              </div>
+              <div style="text-align:center;margin-top:3px"><img src="${code128DataURL(x.l, { height: 40, moduleWidth: 2, showText: true })}" alt="${esc(x.l)}条码" style="max-width:100%"></div>
+            </div>`).join('');
+          })()}
+        </div>
+        <div class="label-footer" style="font-size:11px;color:var(--muted);text-align:center;margin-top:6px">${esc(new Date().toLocaleDateString('zh-CN'))} · 数量: ${fmtQty(Number($('#bl-qty') ? $('#bl-qty').value : 0))}</div>
       </div>
-      <button class="btn primary" style="margin-top:12px" id="bl-print">🖨️ 打印标签</button>`;
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button class="btn primary" style="flex:1" id="bl-print">🖨️ 打印</button>
+      </div>`;
       $('#bl-print').onclick = () => {
-        const p = document.createElement('div');
-        p.style.cssText = 'position:fixed;left:0;top:0;width:100%;z-index:9998';
-        // 100×150mm 打印样式（@page 控制）
-        const node = pv.querySelector('.label-print').cloneNode(true);
-        p.appendChild(node);
-        document.body.appendChild(p);
+        // 品类记忆：打印时记住当前品类（输入的或记忆的都记）
+        if (it.category) {
+          const hc = JSON.parse(localStorage.getItem('xiaoan_label_cats') || '{}');
+          hc[it.sku] = it.category;
+          localStorage.setItem('xiaoan_label_cats', JSON.stringify(hc));
+        }
+        const node = pv.querySelector('.label-sheet').cloneNode(true);
+        const holder = document.createElement('div');
+        holder.style.cssText = 'position:fixed;left:0;top:0;width:100%;z-index:9998';
+        node.querySelectorAll('[style]').forEach(n => n.style.pageBreakInside = 'avoid');
+        holder.appendChild(node);
+        document.body.appendChild(holder);
         const st = document.createElement('style');
-        st.textContent = '@media print{@page{size:100mm 150mm;margin:0}body *{visibility:hidden}.label-print,.label-print *{visibility:visible}.label-print{position:absolute;left:0;top:0;width:100mm;height:150mm;box-sizing:border-box;padding:4mm;border:none}}';
+        st.textContent = '@media print{' +
+          '@page{size:100mm 150mm;margin:0}' +
+          'body *{visibility:hidden}' +
+          '.label-sheet,.label-sheet *{visibility:visible}' +
+          '.label-sheet{position:absolute;left:0;top:0;width:100mm;height:150mm;box-sizing:border-box;padding:3mm;border:none;background:#fff}' +
+          '.label-footer{position:absolute;bottom:2mm;left:0;right:0}}';
         document.head.appendChild(st);
         window.print();
-        setTimeout(() => { document.body.removeChild(p); document.head.removeChild(st); }, 300);
+        setTimeout(() => { document.body.removeChild(holder); document.head.removeChild(st); }, 500);
       };
     } catch (e) { toast(e.message, true); }
   };
@@ -2385,7 +2506,7 @@ async function renderRenoLabel(container) {
 
 /* ===== 可上架匹配 ===== */
 async function renderPutawayMatch(container) {
-  container.innerHTML = navbar('可上架匹配', true) + `
+  container.innerHTML = navbar('可上架匹配', true, `<button class="btn tiny ghost" id="pm-export">⬇️ 导出</button>`) + `
   <div class="page-body">
     <div class="search-bar"><input class="inp" id="pm-q" placeholder="搜索 SKU"><button class="btn primary" id="pm-search">搜索</button></div>
     <div id="pm-list"><div class="loading">加载中...</div></div>
@@ -2406,6 +2527,10 @@ async function renderPutawayMatch(container) {
       } else {
         r = await api('/putaway-match' + (q ? `?q=${encodeURIComponent(q)}` : ''));
       }
+      $('#pm-export').onclick = () => {
+        if (!r.list.length) return toast('暂无数据', true);
+        exportExcel(r.list.map(f => ({ 'SKU': f.sku, '系统库存': f.ss, '实物总量': f.phy, '可上架': f.matchQty, '地堆': f.ground_quantity, '高架': f.high_shelf_quantity, '拣货': f.pick_quantity })), '可上架匹配', '可上架');
+      };
       if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无可上架匹配</div>';
       listEl.innerHTML = r.list.map(f => `
       <div class="list-item">
@@ -2683,7 +2808,7 @@ async function renderRenoTransfer(container) {
 
 /* ===== 包材采购建议 ===== */
 async function renderPurchaseAdvice(container) {
-  container.innerHTML = navbar('包材采购建议', true) + `
+  container.innerHTML = navbar('包材采购建议', true, `<button class="btn tiny ghost" id="pa-export">⬇️ 导出</button>`) + `
   <div class="page-body" id="pa-body"><div class="loading">加载中...</div></div>`;
   try {
     let r;
@@ -2695,6 +2820,12 @@ async function renderPurchaseAdvice(container) {
     } else {
       r = await api('/purchase-advice');
     }
+    $('#pa-export').onclick = () => {
+      const rows = r.advice.map(c => ({ '类型': '低库存补货', '包材编码': c.name, '物料名': c.material_name || '', '储位': c.shelf_code || '', '当前库存': c.stock, '安全库存': c.safety_stock, '缺口': c.gap, 'MOQ': c.moq || 100, '建议采购': c.suggest }))
+        .concat(r.dead.map(c => ({ '类型': '积压清理', '包材编码': c.name, '物料名': c.material_name || '', '储位': c.shelf_code || '', '当前库存': c.stock, '安全库存': c.safety_stock, '缺口': '', 'MOQ': '', '建议采购': '' })));
+      if (!rows.length) return toast('暂无数据', true);
+      exportExcel(rows, '采购建议', '采购');
+    };
     const body = $('#pa-body');
     body.innerHTML = `
     <div class="stat-grid">
@@ -2722,7 +2853,7 @@ async function renderPurchaseAdvice(container) {
 
 /* ===== 使用排行 ===== */
 async function renderUsageRank(container) {
-  container.innerHTML = navbar('使用排行', true) + `<div class="page-body"><div id="ur-body"><div class="loading">加载中...</div></div></div>`;
+  container.innerHTML = navbar('使用排行', true, `<button class="btn tiny ghost" id="ur-export">⬇️ 导出</button>`) + `<div class="page-body"><div id="ur-body"><div class="loading">加载中...</div></div></div>`;
   try {
     let r;
     if (isCloud()) {
@@ -2736,6 +2867,11 @@ async function renderUsageRank(container) {
     } else {
       r = await api('/usage-rank');
     }
+    $('#ur-export').onclick = () => {
+      const rows = r.list.map((x, i) => ({ '排名': i + 1, '包材编码': x.name || '(已删除)', '出库数量': Math.round(x.outQty || x.quantity || 0) }));
+      if (!rows.length) return toast('暂无数据', true);
+      exportExcel(rows, '使用排行', '排行');
+    };
     const body = $('#ur-body');
     if (!r.list.length) { body.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无使用记录</div>'; return; }
     body.innerHTML = `
@@ -2886,7 +3022,7 @@ async function renderHomeSort(container) {
 
 /* ===== SKU 映射管理 ===== */
 async function renderSkuMappings(container) {
-  container.innerHTML = navbar('SKU 映射管理', true, isAdmin() ? `<button class="btn tiny primary" id="sm-add">+ 新增</button>` : '') + `
+  container.innerHTML = navbar('SKU 映射管理', true, `<button class="btn tiny ghost" id="sm-export">⬇️ 导出</button>${isAdmin() ? '<button class="btn tiny primary" id="sm-add">+ 新增</button>' : ''}`) + `
   <div class="page-body">
     <div class="card" style="font-size:12px;color:var(--muted-foreground);line-height:1.6;margin-bottom:12px">SKU ↔ 包材映射：数据源 = 新 BOM 绑定档案（sku_consumable_bindings）+ 备选包材档案（alternative_material_bindings），主 BOM 优先。此处为 SKU→包材映射明细。</div>
     <div class="search-bar"><input class="inp" id="sm-q" placeholder="SKU / 包材编码 / 物料名"><button class="btn primary" id="sm-search">搜索</button></div>
@@ -2915,6 +3051,10 @@ async function renderSkuMappings(container) {
       } else {
         r = await api('/sku-mappings' + (q ? `?q=${encodeURIComponent(q)}` : ''));
       }
+      $('#sm-export').onclick = () => {
+        if (!r.list.length) return toast('暂无数据', true);
+        exportExcel(r.list.map(x => ({ 'SKU': x.sku, '包材编码': x.consumable_name || '', '物料名': x.material_name || '', '备注': x.note || '' })), 'SKU映射', '映射');
+      };
       if (!r.list.length) return listEl.innerHTML = '<div class="empty"><span class="emoji">📭</span>暂无映射</div>';
       listEl.innerHTML = r.list.map(x => `
       <div class="list-item">
@@ -2992,6 +3132,9 @@ function parseHash() {
 }
 async function route() {
   const app = $('#app');
+  window.scrollTo(0, 0);           // 切页回顶，避免上一页滚动残留
+  document.documentElement.scrollTop = 0;
+  document.body.scrollTop = 0;
   const { pathname, query } = parseHash();
   const user = getUser();
   if (!user && pathname !== '/login') { location.hash = '#/login'; return; }
