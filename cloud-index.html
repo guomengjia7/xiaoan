@@ -33,10 +33,10 @@ ul,li{list-style:none}
 
 /* 页面 */
 .page{min-height:100vh;display:flex;flex-direction:column;padding-bottom:70px}
-.page-body{flex:1;padding:12px 14px 24px}
+.page-body{flex:1;padding:8px 10px 20px}
 
 /* 顶部导航 */
-.navbar{position:sticky;top:0;z-index:40;background:#fff;padding:calc(env(safe-area-inset-top) + 10px) 14px 10px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--border)}
+.navbar{position:sticky;top:0;z-index:40;background:#fff;padding:calc(env(safe-area-inset-top) + 6px) 10px 6px;display:flex;align-items:center;gap:6px;border-bottom:1px solid var(--border)}
 .navbar .back{width:34px;height:34px;display:flex;align-items:center;justify-content:center;font-size:24px;color:var(--muted-foreground);border-radius:10px;margin-left:-8px}
 .navbar .back:active{background:var(--background)}
 .navbar .title{font-size:17px;font-weight:700;flex:1;text-align:center}
@@ -72,7 +72,7 @@ ul,li{list-style:none}
 
 /* 统计卡 */
 .stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
-.stat-card{background:#fff;border-radius:var(--radius-l);padding:14px;box-shadow:0 1px 3px rgba(15,23,42,.04)}
+.stat-card{background:#fff;border-radius:var(--radius-l);padding:10px;box-shadow:0 1px 3px rgba(15,23,42,.04)}
 .stat-card .label{font-size:12px;color:var(--muted-foreground);margin-bottom:5px}
 .stat-card .value{font-size:22px;font-weight:800;line-height:1.1}
 .stat-card .sub{font-size:11px;color:var(--muted);margin-top:4px}
@@ -143,7 +143,7 @@ select.inp{appearance:none;background:#fff url("data:image/svg+xml,%3Csvg xmlns=
 .chip.active{background:var(--primary);border-color:var(--primary);color:#fff;font-weight:600}
 
 /* 列表项 */
-.list-item{background:#fff;border-radius:var(--radius-l);padding:13px 14px;margin-bottom:10px;box-shadow:0 1px 3px rgba(15,23,42,.04)}
+.list-item{background:#fff;border-radius:var(--radius-l);padding:10px 11px;margin-bottom:8px;box-shadow:0 1px 3px rgba(15,23,42,.04)}
 .li-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px}
 .li-name{font-size:15px;font-weight:700;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .li-row{display:flex;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--muted-foreground);margin-top:3px}
@@ -337,11 +337,7 @@ async function scanCode(targetId, type) {
         <div style="position:absolute;left:0;bottom:0;width:26px;height:26px;border-left:4px solid #22d3ee;border-bottom:4px solid #22d3ee;border-radius:0 0 0 6px"></div>
         <div style="position:absolute;right:0;bottom:0;width:26px;height:26px;border-right:4px solid #22d3ee;border-bottom:4px solid #22d3ee;border-radius:0 0 6px 0"></div>
       </div>
-      <div style="position:absolute;bottom:18px;left:0;right:0;text-align:center;color:#fff;font-size:12px;text-shadow:0 1px 3px #000">对准条码自动识别 · 双指缩放 · 点按对焦</div>
-      <div id="sc-hit" style="position:absolute;top:14px;left:50%;transform:translateX(-50%);display:none;background:#fff;color:#111;border-radius:12px;padding:10px 16px;font-size:15px;font-weight:700;box-shadow:0 4px 16px rgba(0,0,0,.3);text-align:center;max-width:88%">
-        <div id="sc-hit-val"></div>
-        <div style="font-size:11px;color:#64748b;font-weight:400;margin-top:3px"><span id="sc-hit-cnt">2</span> 秒后自动确认 · 点此立即填入</div>
-      </div>
+      <div style="position:absolute;bottom:18px;left:0;right:0;text-align:center;color:#fff;font-size:12px;text-shadow:0 1px 3px #000">对准条码自动识别填入 · 双指缩放 · 点按对焦</div>
     </div>
     <div style="padding:10px 0 calc(env(safe-area-inset-bottom) + 14px);display:flex;justify-content:center;gap:30px">
       ${caps.torch ? '<button id="sc-torch" style="background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.25);color:#fff;border-radius:50%;width:52px;height:52px;font-size:22px">🔦</button>' : ''}
@@ -381,13 +377,11 @@ async function scanCode(targetId, type) {
     try { await track.applyConstraints({ advanced: [{ torch: torchOn }] }); torchBtn.style.background = torchOn ? 'rgba(255,255,255,.8)' : 'rgba(255,255,255,.12)'; torchBtn.style.color = torchOn ? '#000' : '#fff'; } catch { toast('此手机不支持手电筒', true); }
   };
   const hitBox = layer.querySelector('#sc-hit');
-  const hitVal = layer.querySelector('#sc-hit-val');
-  const hitCnt = layer.querySelector('#sc-hit-cnt');
-  let confirmTimer = null, showingVal = null, closed = false;
+  let closed = false;
 
   const close = () => {
     if (closed) return; closed = true;
-    clearInterval(timer); clearInterval(confirmTimer);
+    clearInterval(timer);
     if (zxReader) { try { zxReader.reset(); } catch {} }
     stream.getTracks().forEach(t => t.stop());
     layer.remove();
@@ -399,66 +393,48 @@ async function scanCode(targetId, type) {
     if (type === 'sku' && /^(AA|AB|AC|HC|DD|FX|BF|HX)-\d/i.test(v)) return '这是储位编码，不是 SKU';
     return null;
   }
-  function showHit(v) {
+  // 识别到 → 校验 → 直接填入并触发查询（无倒计时）
+  function accept(v) {
     const err = validate(v);
     if (err) { toast(err + '：' + v, true); navigator.vibrate && navigator.vibrate([60, 60]); return; }
-    if (showingVal === v && hitBox.style.display === 'block') return;
-    showingVal = v;
-    hitVal.textContent = v;
-    hitBox.style.display = 'block';
-    clearInterval(confirmTimer);
-    let n = 2;
-    hitCnt.textContent = n;
-    confirmTimer = setInterval(() => {
-      n--;
-      hitCnt.textContent = n;
-      if (n <= 0) { clearInterval(confirmTimer); doFill(); }
-    }, 1000);
-  }
-  hitBox.onclick = () => { clearInterval(confirmTimer); doFill(); };
-  function doFill() {
-    if (!showingVal) return;
-    const v = showingVal;
     close();
     target.value = v;
     target.dispatchEvent(new Event('input', { bubbles: true }));
     target.dispatchEvent(new Event('change', { bubbles: true }));
     navigator.vibrate && navigator.vibrate(30);
     toast('已识别：' + v);
+    // 自动触发查询：优先点同域查询按钮；否则触发 input 事件（自动搜索页已监听）
     const wrap = target.parentElement;
     const sib = wrap && wrap.querySelector('button');
     if (sib && /search|查询|搜索/i.test(sib.textContent)) sib.click();
   }
   layer.querySelector('#sc-input').onclick = () => {
     const v = prompt('手动输入：');
-    if (v) showHit(v.trim());
+    if (v) { const e = validate(v.trim()); if (e) return toast(e, true); accept(v.trim()); }
   };
 
-  // ===== 识别引擎 =====
+  // ===== 识别引擎（第一帧有效即填入，最快速度）=====
   let timer = null;
+  let lastVal = '', lastCnt = 0;
   if (useNative) {
-    // 原生：200ms 轮询帧，连续 2 帧同值才弹条
-    let lastVal = '', lastCnt = 0;
     timer = setInterval(async () => {
-      if (closed || hitBox.style.display === 'block') return;
+      if (closed) return;
       try {
         const codes = await detector.detect(video);
         const v = codes && codes.length ? codes[0].rawValue : '';
         if (!v) { lastCnt = 0; return; }
-        if (v === lastVal) lastCnt++; else { lastVal = v; lastCnt = 1; }
-        if (lastCnt >= 2) showHit(v);
+        // 连续2帧同值才确认（挡单帧噪点，仍极快 ~0.2s）
+        if (v === lastVal) { lastCnt++; } else { lastVal = v; lastCnt = 1; }
+        if (lastCnt >= 2) accept(v);
       } catch {}
-    }, 200);
+    }, 80);
   } else {
-    // ZXing：持续解码，回调有结果即弹条（连续 2 次不同帧同值）
-    let lastVal = '', lastCnt = 0, lastT = 0;
     zxReader.decodeFromVideoDevice(undefined, video, (result) => {
-      if (closed || !result || hitBox.style.display === 'block') return;
+      if (closed || !result) return;
       const v = result.getText();
       if (!v) return;
-      const now = Date.now();
       if (v === lastVal) { lastCnt++; } else { lastVal = v; lastCnt = 1; }
-      if (lastCnt >= 2 && now - lastT > 800) { lastT = now; showHit(v); }
+      if (lastCnt >= 2) accept(v);
     }).catch(() => {});
   }
 }
@@ -1095,6 +1071,52 @@ async function renderHome(container) {
   } catch (e) { $('#home-body').innerHTML = `<div class="empty"><span class="emoji">😳</span>${esc(e.message)}</div>`; }
 }
 
+/* ===== 智能拣货储位推荐 =====
+ * 规则（用户业务规则，纠正版）：
+ *   1. 优先地堆位——能整量满足就直接用地堆
+ *   2. 地堆不够时，按剩余需求量决定高架位方向：
+ *      剩余量少(零头) → 库存少的高架位（避免拆散大储位）
+ *      剩余量多      → 库存多的高架位（快速凑量）
+ *   3. 【关键】禁用储位=已满，禁止的是上架/打印箱唛（往里放），
+ *      出库必须允许（从满储位出货腾空间）→ 出库推荐【不排除】禁用位
+ *   4. 库存不足不拦截，仅返回缺口警告（下单时库存一定够，缺口多为并发/盘点差异）
+ *   5. 拣货位字段是过渡期数据，原系统无此概念——算法兼容有/无拣货位数据
+ */
+function recommendPickPlan(qty, fg, highs, restricts) {
+  const need = Number(qty) || 0;
+  const plan = [];
+  let remain = need;
+  // 1. 地堆优先（出库不排除禁用位）
+  const gLoc = fg.ground_location, gQty = Number(fg.ground_quantity) || 0;
+  if (gLoc && gQty > 0) {
+    const take = Math.min(remain, gQty);
+    plan.push({ loc: gLoc, qty: take, type: '地堆位' });
+    remain -= take;
+  }
+  // 2. 拣货位（如数据里有则利用；原系统无此字段时为空，自然跳过）
+  if (remain > 0) {
+    const pLoc = fg.pick_location, pQty = Number(fg.pick_quantity) || 0;
+    if (pLoc && pQty > 0) {
+      const take = Math.min(remain, pQty);
+      plan.push({ loc: pLoc, qty: take, type: '拣货位' });
+      remain -= take;
+    }
+  }
+  // 3. 高架位：剩余少→库存少优先；剩余多→库存多优先（出库不排除禁用位）
+  if (remain > 0) {
+    const okHighs = (highs || []).filter(h => Number(h.quantity) > 0);
+    const asc = remain <= 50; // 剩余零头阈值 50 件，可调
+    const sorted = okHighs.slice().sort((a, b) => asc ? Number(a.quantity) - Number(b.quantity) : Number(b.quantity) - Number(a.quantity));
+    for (const h of sorted) {
+      if (remain <= 0) break;
+      const take = Math.min(remain, Number(h.quantity));
+      plan.push({ loc: h.location, qty: take, type: '高架位' });
+      remain -= take;
+    }
+  }
+  return remain > 0 ? { plan, short: remain } : { plan, short: 0 };
+}
+
 /* 常用功能宫格：按使用频率推荐（localStorage 计数） */
 const ALL_GRIDS = [
   { href: '#/fg-stock', ico: '🔎', cls: 'var(--teal-soft)', name: '实物库存查询', desc: '成品SKU/PN/储位', dft: 1 },
@@ -1532,6 +1554,10 @@ async function renderFGStock(container) {
       if (isCloud()) {
         // 全量加载（缓存 60s）+ 前端过滤，避免 PostgREST filter 400
         const all = await supa.rest('finished_goods_stock', { select: 'sku,system_stock,ground_location,ground_quantity,high_shelf_location,high_shelf_quantity,pick_location,pick_quantity,new_quantity', order: 'sku', limit: 5000, cacheMs: 60000 });
+        // 禁用储位清单（disable_label_print 或 disable_transfer 任一启用）
+        const restrictSet = new Set((await supa.rest('shelf_restrictions', { select: 'shelf_no,disable_transfer,disable_label_print', limit: 500, cacheMs: 30000 }))
+          .filter(s => Number(s.disable_transfer) === 1 || Number(s.disable_label_print) === 1).map(s => s.shelf_no));
+        window._xiaoan_restricts = restrictSet;
         let list = all;
         if (q) {
           const ql = q.toLowerCase();
@@ -1539,6 +1565,7 @@ async function renderFGStock(container) {
         }
         if (kind === 'new') list = list.filter(f => Number(f.new_quantity) > 0);
         if (kind === 'bad') list = list.filter(f => (Number(f.ground_quantity) || 0) + (Number(f.high_shelf_quantity) || 0) + (Number(f.pick_quantity) || 0) > 0);
+        const restricts = restrictSet;
         const pageList = list.slice(0, 500);
         // 高架明细
         const highMap = {};
@@ -1552,6 +1579,7 @@ async function renderFGStock(container) {
         r = {
           list: pageList,
           highMap,
+          restricts,
           stats: {
             totalSkus: all.length, zeroSkus: all.filter(f => (Number(f.ground_quantity) || 0) + (Number(f.high_shelf_quantity) || 0) + (Number(f.pick_quantity) || 0) === 0).length,
             totalQty: sum(all, 'ground_quantity') + sum(all, 'high_shelf_quantity') + sum(all, 'pick_quantity'),
@@ -1580,6 +1608,8 @@ async function renderFGStock(container) {
         const low = phy > 0 && sys < phy;
         const gap = phy - sys;
         const gapBig = phy > 0 && Math.abs(gap) >= 10 && Math.abs(gap) >= Math.abs(sys) * 0.2;
+        const rs = r.restricts || window._xiaoan_restricts || new Set();
+        const locTag = loc => rs.has(loc) ? ' <span class="badge" style="background:#fef2f2;color:#dc2626;font-size:10px;padding:1px 5px">禁用</span>' : '';
         return `
         <div class="list-item">
           <div class="li-head"><span class="li-name">${esc(f.sku)}</span>
@@ -1589,8 +1619,8 @@ async function renderFGStock(container) {
               <span style="font-size:13px;font-weight:700">${low ? '<span style="color:var(--red)">' + fmtQty(phy) + '</span>' : fmtQty(phy)}</span>
             </span></div>
           <div class="li-row"><span>系统库存:<b>${fmtQty(Number(f.system_stock) || 0)}</b></span></div>
-          <div class="li-row"><span>地堆位 <b>${f.ground_location ? esc(f.ground_location) : '-'}</b> · ${fmtQty(f.ground_quantity)}</span></div>
-          ${highs.length ? highs.map((h, i) => `<div class="li-row"><span>高架位${highs.length > 1 ? i + 1 : ''} <b>${esc(h.location)}</b> · ${fmtQty(h.quantity)}</span></div>`).join('') :
+          <div class="li-row"><span>地堆位 <b>${f.ground_location ? esc(f.ground_location) : '-'}</b>${f.ground_location ? locTag(f.ground_location) : ''} · ${fmtQty(f.ground_quantity)}</span></div>
+          ${highs.length ? highs.map((h, i) => `<div class="li-row"><span>高架位${highs.length > 1 ? i + 1 : ''} <b>${esc(h.location)}</b>${locTag(h.location)} · ${fmtQty(h.quantity)}</span></div>`).join('') :
             `<div class="li-row"><span>高架位 - · ${fmtQty(f.high_shelf_quantity)}</span></div>`}
         </div>`;
       }).join('');
@@ -1682,71 +1712,224 @@ async function renderPutaway(container) {
 
 /* ===== 拣货出库 ===== */
 async function renderFGPicking(container) {
-  container.innerHTML = navbar('拣货出库', true) + `
+  const admin = isAdmin();
+  container.innerHTML = navbar('拣货出库', true, admin ? `<button class="btn tiny primary" id="pk-newtask">📋 下任务</button>` : '') + `
   <div class="page-body">
+    <div class="filter-row" id="pk-view">
+      <button class="chip active" data-v="pick">🧺 执行拣货</button>
+      ${admin ? '<button class="chip" data-v="tasks">📋 任务列表(管理员)</button>' : ''}
+    </div>
+    <div id="pk-panel"></div>
+  </div>`;
+  const panel = $('#pk-panel');
+  let view = 'pick';
+
+  // ===== 执行拣货（两视角共用）=====
+  async function renderPick() {
+    panel.innerHTML = `
     <div class="card">
+      <div style="font-size:13px;font-weight:700;margin-bottom:8px">${admin ? '管理员拣货（也可在此直接出库）' : '员工拣货'}</div>
       <div class="field"><label class="req">SKU</label>
-        <div class="input-group"><span class="ig-ico">📦</span><input id="pk-sku" placeholder="输入 SKU"><button class="btn tiny ghost" onclick="scanCode('pk-sku','sku')">📷</button><button class="btn tiny primary" id="pk-query">查询</button></div></div>
+        <div class="input-group"><span class="ig-ico">📦</span><input id="pk-sku" placeholder="输入或扫 SKU"><button class="btn tiny ghost" onclick="scanCode('pk-sku','sku')">📷</button><button class="btn tiny primary" id="pk-query">查询</button></div></div>
       <div id="pk-info" style="margin-bottom:12px"></div>
       <div class="field"><label class="req">出库数量</label><input class="inp" id="pk-qty" type="number" min="1"></div>
-      <div class="field"><label class="req">出库储位</label>
-        <div class="input-group"><span class="ig-ico">📍</span><input id="pk-loc" placeholder="选择或输入储位"><button class="btn tiny ghost" onclick="scanCode('pk-loc','loc')">📷</button></div>
+      <div class="field"><label>出库储位（非必填，不填由系统推荐）</label>
+        <div class="input-group"><span class="ig-ico">📍</span><input id="pk-loc" placeholder="可扫/可输/可不填"><button class="btn tiny ghost" onclick="scanCode('pk-loc','loc')">📷</button></div>
         <div id="pk-locs" style="margin-top:8px"></div></div>
       <div class="field"><label>性质</label>
         <select class="inp" id="pk-nature"><option value="不良品">不良品</option><option value="全新品">全新品</option></select></div>
       <button class="btn danger" id="pk-submit">确认出库</button>
-    </div>
-  </div>`;
-  let fg = null;
-  const highsCache = [];
-  const querySku = async () => {
-    const sku = trim($('#pk-sku').value);
-    if (!sku) return toast('请输入 SKU', true);
+    </div>`;
+    let fg = null, lastHighs = [];
+    const querySku = async () => {
+      const sku = trim($('#pk-sku').value);
+      if (!sku) return toast('请输入 SKU', true);
+      try {
+        let fg0 = null, highs = [];
+        if (isCloud()) {
+          fg0 = await supa.rest('finished_goods_stock', { select: '*', filter: `sku=eq.${sku}`, single: true });
+          if (fg0) highs = await supa.rest('finished_goods_stock_high_shelves', { select: 'location,quantity', filter: `sku=eq.${sku}`, order: 'created_at' });
+        } else {
+          const r = await api('/finished-goods?q=' + encodeURIComponent(sku));
+          fg0 = r.list.find(x => x.sku === sku) || null;
+          highs = r.highMap[fg0?.sku] || [];
+        }
+        fg = fg0; lastHighs = highs;
+        const info = $('#pk-info');
+        if (!fg) { info.innerHTML = '<div style="color:var(--red);font-size:13px">❌ SKU 不存在</div>'; return; }
+        info.innerHTML = `<div style="background:var(--orange-soft);padding:9px 11px;border-radius:10px;font-size:12px;line-height:1.7">
+          <b>${esc(fg.sku)}</b> · 系统库存 ${fmtQty(Number(fg.system_stock) || 0)} · 可出库实物 ${fmtQty((Number(fg.ground_quantity)||0)+(Number(fg.high_shelf_quantity)||0)+(Number(fg.pick_quantity)||0))}</div>`;
+        const locs = [];
+        if (Number(fg.ground_quantity) > 0 && fg.ground_location) locs.push({ loc: fg.ground_location, q: fg.ground_quantity, type: '地堆位' });
+        highs.forEach(h => locs.push({ loc: h.location, q: h.quantity, type: '高架位' }));
+        if (Number(fg.pick_quantity) > 0 && fg.pick_location) locs.push({ loc: fg.pick_location, q: fg.pick_quantity, type: '拣货位' });
+        $('#pk-locs').innerHTML = locs.length ? locs.map(l => `
+          <div class="sub-item" data-loc="${esc(l.loc)}" style="border:1px solid var(--border);border-radius:10px;margin-bottom:6px">
+            <div class="s-text"><div class="s-name">${l.type} · ${esc(l.loc)}</div><div class="s-desc">可出 ${fmtQty(l.q)} 件</div></div>
+          </div>`).join('') : '<div style="font-size:12px;color:var(--muted)">无可出库储位</div>';
+        $('#pk-locs').querySelectorAll('[data-loc]').forEach(n => n.onclick = () => {
+          $('#pk-loc').value = n.dataset.loc;
+          $('#pk-locs').querySelectorAll('.sub-item').forEach(x => x.style.borderColor = 'var(--border)');
+          n.style.borderColor = 'var(--primary)';
+        });
+        // 输入数量后显示推荐拣货方案
+        const showPlan = () => {
+          const q = Number($('#pk-qty').value) || 0;
+          const planEl = $('#pk-plan');
+          if (!q || !fg) { if (planEl) planEl.innerHTML = ''; return; }
+          if (!planEl) { const pd = el('div'); pd.id = 'pk-plan'; $('#pk-locs').parentElement.appendChild(pd); }
+          const restricts = window._xiaoan_restricts || new Set();
+          const { plan, short } = recommendPickPlan(q, fg, lastHighs, restricts);
+          $('#pk-plan').innerHTML = `
+            <div style="background:var(--primary-soft);padding:8px 10px;border-radius:10px;margin-top:8px;font-size:12px;line-height:1.8">
+              <div style="font-weight:700;margin-bottom:2px">🧭 推荐拣货方案</div>
+              ${plan.map((p, i) => `<div>第${i + 1}步：${p.type} <b>${esc(p.loc)}</b> 取 <b>${fmtQty(p.qty)}</b> 件${(window._xiaoan_restricts || new Set()).has(p.loc) ? ' <span style="color:var(--orange);font-size:10px">（该位已满，出货可腾空间）</span>' : ''}</div>`).join('')}
+              ${short > 0 ? `<div style="color:var(--red)">⚠️ 推荐${
+                plan.reduce((s, x) => s + x.qty, 0)} 件后仍缺 ${fmtQty(short)} 件，提交时需确认</div>` : ''}
+              <div style="font-size:11px;color:var(--muted-foreground);margin-top:2px">规则：优先地堆；零头→库存少高架，大批→库存多高架；满储位可出货</div>
+            </div>`;
+        };
+        $('#pk-qty').oninput = showPlan;
+        showPlan();
+      } catch (e) { toast(e.message, true); }
+    };
+    $('#pk-query').onclick = querySku;
+    $('#pk-sku').addEventListener('keydown', e => { if (e.key === 'Enter') querySku(); });
+    $('#pk-submit').onclick = async () => {
+      const sku = trim($('#pk-sku').value), locIn = trim($('#pk-loc').value), qty = Number($('#pk-qty').value);
+      if (!sku || !qty || qty <= 0) return toast('请填写 SKU 和数量', true);
+      try {
+        // 指定储位→单步；未指定→按智能推荐方案多步出库
+        let steps;
+        if (locIn) steps = [{ loc: locIn, qty }];
+        else {
+          if (!fg) return toast('请先查询 SKU', true);
+          const restricts = window._xiaoan_restricts || new Set();
+          const { plan, short } = recommendPickPlan(qty, fg, lastHighs, restricts);
+          if (!plan.length) return toast('无可推荐储位，请手动指定', true);
+          steps = plan;
+          if (short > 0 && !(await confirmBox(`⚠️ 推荐方案仍缺 ${fmtQty(short)} 件（可能并发出库），仍要按当前方案出库吗？`))) return;
+        }
+        const stepsTxt = steps.length === 1 ? `${steps[0].loc} × ${steps[0].qty}` : steps.map((s, i) => `${i + 1}.${s.loc}×${s.qty}`).join('  ');
+        if (!(await confirmBox(`确认出库 ${sku} 共 ${qty} 件？\n${stepsTxt}`))) return;
+        let lastBatch = '';
+        for (const s of steps) {
+          let r;
+          if (isCloud()) r = await cloudWrite.fgPicking(sku, s.loc, s.qty, $('#pk-nature').value);
+          else r = await api('/fg-picking', { method: 'POST', body: { sku, location: s.loc, qty: s.qty, nature: $('#pk-nature').value } });
+          lastBatch = r.batchNo;
+        }
+        toast(`✅ 出库成功（${steps.length} 步）${lastBatch ? '，单号 ' + lastBatch.slice(0, 20) : ''}`);
+        // 完成对应任务（如有）
+        if (isCloud()) {
+          const t = await supa.rest('fg_picking_tasks', { select: 'id,status', filter: `sku=eq.${sku}&status=eq.pending`, single: true });
+          if (t) await supa.update('fg_picking_tasks', `id=eq.${t.id}`, { status: 'completed', completed_by: getUser()?.username || '', updated_at: new Date().toISOString() });
+          supa.invalidate();
+        }
+        renderPick();
+      } catch (e) { toast(e.message, true); }
+    };
+  }
+
+  // ===== 任务列表（管理员）=====
+  async function renderTasks() {
+    panel.innerHTML = '<div id="pk-tasks"><div class="loading">加载中...</div></div>';
+    const el = $('#pk-tasks');
     try {
-      let fg0 = null, highs = [];
-      if (isCloud()) {
-        fg0 = await supa.rest('finished_goods_stock', { select: '*', filter: `sku=eq.${sku}`, single: true });
-        if (fg0) highs = await supa.rest('finished_goods_stock_high_shelves', { select: 'location,quantity', filter: `sku=eq.${sku}`, order: 'created_at' });
-      } else {
-        const r = await api('/finished-goods?q=' + encodeURIComponent(sku));
-        fg0 = r.list.find(x => x.sku === sku) || null;
-        highs = r.highMap[fg0?.sku] || [];
-      }
-      fg = fg0;
-      const info = $('#pk-info');
-      if (!fg) { info.innerHTML = '<div style="color:var(--red);font-size:13px">❌ SKU 不存在</div>'; return; }
-      info.innerHTML = `<div style="background:var(--orange-soft);padding:9px 11px;border-radius:10px;font-size:12px;line-height:1.7">
-        <b>${esc(fg.sku)}</b> · 系统库存 ${fmtQty(Number(fg.system_stock) || 0)} · 可出库实物 ${fmtQty((Number(fg.ground_quantity)||0)+(Number(fg.high_shelf_quantity)||0)+(Number(fg.pick_quantity)||0))}</div>`;
-      // 储位选项
-      const locs = [];
-      if (fg.ground_quantity > 0 && fg.ground_location) locs.push({ loc: fg.ground_location, q: fg.ground_quantity, type: '地堆位' });
-      highs.forEach(h => locs.push({ loc: h.location, q: h.quantity, type: '高架位' }));
-      if (fg.pick_quantity > 0 && fg.pick_location) locs.push({ loc: fg.pick_location, q: fg.pick_quantity, type: '拣货位' });
-      $('#pk-locs').innerHTML = locs.length ? locs.map(l => `
-        <div class="sub-item" data-loc="${esc(l.loc)}" style="border:1px solid var(--border);border-radius:10px;margin-bottom:6px">
-          <div class="s-text"><div class="s-name">${l.type} · ${esc(l.loc)}</div><div class="s-desc">可出 ${fmtQty(l.q)} 件</div></div>
-        </div>`).join('') : '<div style="font-size:12px;color:var(--muted)">无可出库储位</div>';
-      $('#pk-locs').querySelectorAll('[data-loc]').forEach(n => n.onclick = () => {
-        $('#pk-loc').value = n.dataset.loc;
-        $('#pk-locs').querySelectorAll('.sub-item').forEach(x => x.style.borderColor = 'var(--border)');
-        n.style.borderColor = 'var(--primary)';
-      });
-    } catch (e) { toast(e.message, true); }
-  };
-  $('#pk-query').onclick = querySku;
-  $('#pk-sku').addEventListener('keydown', e => { if (e.key === 'Enter') querySku(); });
-  $('#pk-submit').onclick = async () => {
-    const sku = trim($('#pk-sku').value), loc = trim($('#pk-loc').value), qty = Number($('#pk-qty').value);
-    if (!sku || !loc || !qty || qty <= 0) return toast('请完整填写 SKU、储位、数量', true);
-    if (!(await confirmBox(`确认出库 ${sku} × ${qty}（储位 ${loc}）？`))) return;
-    try {
-      let r;
-      if (isCloud()) r = await cloudWrite.fgPicking(sku, loc, qty, $('#pk-nature').value);
-      else r = await api('/fg-picking', { method: 'POST', body: { sku, location: loc, qty, nature: $('#pk-nature').value } });
-      toast(`✅ 出库成功，单号 ${r.batchNo.slice(0, 20)}...`);
-      $('#pk-sku').value = ''; $('#pk-loc').value = ''; $('#pk-qty').value = ''; $('#pk-info').innerHTML = ''; $('#pk-locs').innerHTML = '';
-    } catch (e) { toast(e.message, true); }
-  };
+      let tasks = [];
+      if (isCloud()) tasks = await supa.rest('fg_picking_tasks', { select: 'id,batch_no,sku,demand_qty,status,operator,created_at', order: 'created_at.desc', limit: 200 });
+      else { const r = await api('/fg-picking-tasks'); tasks = r.list; }
+      const HTML = `
+      ${admin ? `<button class="btn primary" style="width:100%;margin-bottom:10px" id="pt-add">+ 新建拣货任务</button>` : ''}
+      ${tasks.length ? tasks.map(t => `
+      <div class="list-item">
+        <div class="li-head"><span class="li-name">${esc(t.sku)}</span>
+          <span class="badge ${t.status === 'completed' ? 'teal' : t.status === 'pending' ? 'gray' : 'red'}">${t.status === 'completed' ? '已完成' : t.status === 'pending' ? '待拣货' : '已取消'}</span></div>
+        <div class="li-row"><span>需求量:<b>${fmtQty(t.demand_qty)}</b></span><span>批次:${esc((t.batch_no || '').slice(0, 16))}</span></div>
+        <div class="li-row"><span>下单人:${esc(t.operator || '-')}</span><span>${esc((t.created_at || '').replace('T', ' ').slice(0, 16))}</span></div>
+      </div>`).join('') : '<div class="empty"><span class="emoji">📭</span>暂无任务</div>'}`;
+      el.innerHTML = HTML;
+      if (admin) $('#pt-add').onclick = () => openTaskForm(() => renderTasks());
+    } catch (e) { el.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+  }
+
+  // 下单弹窗：支持单条 + 批量（多行粘贴 SKU,数量,储位）
+  function openTaskForm(onDone) {
+    const u = getUser();
+    const dlg = el('div');
+    dlg.style.cssText = 'position:fixed;inset:0;z-index:999;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;overflow:auto;padding:20px 0';
+    const box = el('div');
+    box.style.cssText = 'background:#fff;border-radius:16px;max-width:480px;width:92%;padding:14px 16px;margin:auto';
+    box.innerHTML = `
+      <div style="font-weight:700;margin-bottom:10px">新建拣货任务</div>
+      <div class="segment" style="display:flex;gap:6px;margin-bottom:12px">
+        <button class="btn tiny primary" id="tf-single">单条下单</button><button class="btn tiny ghost" id="tf-batch">批量下单</button>
+      </div>
+      <div id="tf-body"></div>`;
+    dlg.appendChild(box); document.body.appendChild(dlg);
+    const singleHtml = `
+      <div class="field"><label class="req">SKU</label><div class="input-group"><input id="tf-sku" placeholder="输入或扫 SKU"><button class="btn tiny ghost" onclick="scanCode('tf-sku','sku')">📷</button></div></div>
+      <div class="field"><label class="req">数量</label><input class="inp" id="tf-qty" type="number" min="1"></div>
+      <div class="field"><label>储位（非必填）</label><div class="input-group"><input id="tf-loc" placeholder="可扫/可输/可不填"><button class="btn tiny ghost" onclick="scanCode('tf-loc','loc')">📷</button></div></div>
+      <button class="btn primary" id="tf-submit" style="width:100%;margin-top:10px">下 发</button>`;
+    const batchHtml = `
+      <div style="font-size:12px;color:var(--muted-foreground);margin-bottom:6px">每行一条，格式：<b>SKU,数量,储位</b>（储位可省略）<br>例：<br>A121D621,10,AB-08-01-004<br>B121D621,5</div>
+      <textarea class="inp" id="tf-batch-text" rows="7" placeholder="A121D621,10,AB-08-01-004&#10;B121D621,5" style="font-family:monospace"></textarea>
+      <button class="btn primary" id="tf-batch-submit" style="width:100%;margin-top:10px">批量下发</button>`;
+    let mode = 'single';
+    const body = box.querySelector('#tf-body');
+    body.innerHTML = singleHtml;
+    box.querySelector('#tf-single').onclick = () => { mode = 'single'; body.innerHTML = singleHtml; bindSingle(); box.querySelector('#tf-single').className = 'btn tiny primary'; box.querySelector('#tf-batch').className = 'btn tiny ghost'; };
+    box.querySelector('#tf-batch').onclick = () => { mode = 'batch'; body.innerHTML = batchHtml; bindBatch(); box.querySelector('#tf-batch').className = 'btn tiny primary'; box.querySelector('#tf-single').className = 'btn tiny ghost'; };
+    function bindSingle() {
+      box.querySelector('#tf-submit').onclick = async () => {
+        const sku = trim(box.querySelector('#tf-sku').value), qty = Number(box.querySelector('#tf-qty').value), loc = trim(box.querySelector('#tf-loc').value);
+        if (!sku || qty <= 0) return toast('SKU 和数量必填', true);
+        await postTasks([{ sku, qty, loc }], onDone, dlg);
+      };
+    }
+    function bindBatch() {
+      box.querySelector('#tf-batch-submit').onclick = async () => {
+        const text = box.querySelector('#tf-batch-text').value.trim();
+        if (!text) return toast('请输入批量内容', true);
+        const items = text.split('\n').map(line => {
+          const p = line.split(',').map(s => s.trim());
+          return { sku: p[0], qty: Number(p[1]) || 0, loc: p[2] || '' };
+        }).filter(x => x.sku && x.qty > 0);
+        if (!items.length) return toast('未解析出有效条目', true);
+        await postTasks(items, onDone, dlg);
+      };
+    }
+    async function postTasks(items, done, dlgEl) {
+      const batchNo = `FGP${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}${Math.random().toString(36).slice(2, 5).toUpperCase()}`;
+      try {
+        for (const it of items) {
+          if (isCloud()) {
+            await supa.insert('fg_picking_tasks', {
+              id: crypto.randomUUID(), batch_no: batchNo, sku: it.sku, demand_qty: it.qty,
+              recommend: JSON.stringify({ assignedLoc: it.loc || '' }), status: 'pending',
+              operator: u?.username || '', created_by: u?.id || '', completed_by: '', record_id: '',
+              created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+            });
+          } else {
+            await api('/fg-picking-tasks', { method: 'POST', body: { sku: it.sku, demand_qty: it.qty, batch_no: batchNo, location: it.loc } });
+          }
+        }
+        if (isCloud()) supa.invalidate();
+        toast(`✅ 已下发 ${items.length} 条任务`);
+        dlgEl.remove(); done && done();
+      } catch (e) { toast(e.message, true); }
+    }
+    bindSingle();
+  }
+
+  // 视角切换
+  $('#pk-view').querySelectorAll('.chip').forEach(ch => ch.onclick = () => {
+    view = ch.dataset.v;
+    $('#pk-view').querySelectorAll('.chip').forEach(x => x.classList.toggle('active', x === ch));
+    view === 'pick' ? renderPick() : renderTasks();
+  });
+  renderPick();
 }
 
 /* ===== 逆向移库 ===== */
@@ -2399,16 +2582,14 @@ async function renderBoxLabel(container) {
           ${it.category ? `<div style="font-size:13px;color:var(--muted-foreground);margin-bottom:6px">品类：${esc(it.category)}</div>` : ''}
           <div style="text-align:center;margin:4px 0 8px"><img src="${code128DataURL(it.sku, { height: 46, moduleWidth: 2 })}" alt="SKU条码" style="max-width:100%"></div>
           ${(function () {
-            // 推荐逻辑：地堆位（首推）+ 数量最少且未禁用的高架位
+            // 只打两个推荐位：地堆位（有量则推）+ 数量最少且未禁用的高架位。不列其他。
             const lines = [];
-            if (it.ground_location && Number(it.ground_quantity) > 0) lines.push({ l: it.ground_location, t: '地堆位', q: it.ground_quantity, tag: '推荐' });
-            if (it.recommended_high) lines.push({ l: it.recommended_high.location, t: '高架位', q: it.recommended_high.quantity, tag: '推荐' });
-            const others = it.high_shelves.filter(h => Number(h.quantity) > 0).map(h => ({ l: h.location, t: '高架', q: h.quantity, tag: '' }));
-            const all = lines.concat(others.filter(o => !lines.find(x => x.l === o.l)));
-            return all.map(x => `
+            if (it.ground_location && Number(it.ground_quantity) > 0) lines.push({ l: it.ground_location, t: '地堆位', q: it.ground_quantity });
+            if (it.recommended_high) lines.push({ l: it.recommended_high.location, t: '高架位', q: it.recommended_high.quantity });
+            return lines.map(x => `
             <div style="margin-top:8px;padding-top:6px;border-top:1px dashed var(--border)">
               <div style="display:flex;justify-content:space-between;align-items:baseline">
-                <span style="font-size:${fmt.locSize}px;font-family:monospace;font-weight:800;letter-spacing:1px">${esc(x.l)}${x.tag === '推荐' ? ' <span style="font-size:10px;color:var(--green);font-weight:400">推荐</span>' : ''}</span>
+                <span style="font-size:${fmt.locSize}px;font-family:monospace;font-weight:800;letter-spacing:1px">${esc(x.l)}</span>
                 ${fmt.showQty ? `<span style="font-size:13px;font-weight:700">${fmtQty(x.q)}</span>` : ''}
               </div>
               <div style="text-align:center;margin-top:3px"><img src="${code128DataURL(x.l, { height: 40, moduleWidth: 2, showText: true })}" alt="${esc(x.l)}条码" style="max-width:100%"></div>
@@ -2904,7 +3085,14 @@ async function renderDistrWork(container) {
     const sku = trim($('#dw-sku').value);
     if (!sku) return toast('请输入 SKU', true);
     try {
-      const r = await api('/distr-work?sku=' + encodeURIComponent(sku));
+      let r;
+      if (isCloud()) {
+        const mappings = await supa.rest('picking_mappings', { select: 'sku,channel,location', filter: `sku=ilike.*${sku}*`, limit: 50 });
+        const stock = await supa.rest('finished_goods_stock', { select: 'sku,system_stock,ground_quantity,high_shelf_quantity,pick_quantity', filter: `sku=eq.${sku}`, single: true });
+        r = { mappings, stock };
+      } else {
+        r = await api('/distr-work?sku=' + encodeURIComponent(sku));
+      }
       const rs = $('#dw-result');
       if (!r.mappings.length) { rs.innerHTML = '<div style="color:var(--muted);font-size:13px">未找到该 SKU 的分货映射</div>'; return; }
       const s = r.stock;
